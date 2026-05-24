@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT
 
 make
-./httpd -p "${PORT}" -r www -t 4 -q 16 -l access.log > /tmp/httpd-test.log 2>&1 &
+./httpd -p "${PORT}" -r www -t 8 -q 128 -l access.log > /tmp/httpd-test.log 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 50); do
