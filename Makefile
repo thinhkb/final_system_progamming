@@ -39,8 +39,13 @@ test-unit: tests/unit_http tests/unit_files tests/unit_thread_pool
 test-integration:
 	./tests/run_tests.sh
 
-bench:
-	@echo "benchmark will be added in later tasks"
+bench: all
+	@set -e; \
+	./$(BIN) -p 18080 -r www -t 8 -q 128 -l access.log >/tmp/httpd-bench.log 2>&1 & \
+	server_pid=$$!; \
+	trap 'kill $$server_pid 2>/dev/null || true; wait $$server_pid 2>/dev/null || true' EXIT; \
+	sleep 1; \
+	./bench/bench.sh 127.0.0.1 18080 /index.html 120
 
 clean:
 	rm -f $(BIN) src/*.o tests/*.o tests/unit_http tests/unit_files tests/unit_thread_pool access.log

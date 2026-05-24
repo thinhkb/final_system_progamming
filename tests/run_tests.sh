@@ -47,3 +47,4 @@ keep_alive_response=$(
 [[ "$(grep -c "HTTP/1.1 200 OK" <<< "${keep_alive_response}")" -eq 2 ]]
 
 grep -q '"GET /index.html HTTP/1.1" 200' access.log
+./bench/bench.sh "${HOST}" "${PORT}" /index.html 120
