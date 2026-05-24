@@ -2,8 +2,8 @@ CC := gcc
 CFLAGS := -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -Iinclude
 LDFLAGS := -pthread
 
-SRC := src/main.c src/http.c src/files.c src/thread_pool.c src/server.c
-COMMON_SRC := src/http.c src/files.c src/thread_pool.c src/server.c
+SRC := src/main.c src/http.c src/files.c src/thread_pool.c src/server.c src/log.c
+COMMON_SRC := src/http.c src/files.c src/thread_pool.c src/server.c src/log.c
 TEST_HTTP_SRC := tests/unit_http.c $(COMMON_SRC)
 TEST_FILES_SRC := tests/unit_files.c src/files.c
 TEST_THREAD_POOL_SRC := tests/unit_thread_pool.c src/thread_pool.c

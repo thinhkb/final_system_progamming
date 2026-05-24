@@ -3,6 +3,7 @@
 
 #include "config.h"
 
+#include "log.h"
 #include "thread_pool.h"
 
 #include <signal.h>
@@ -13,6 +14,7 @@ typedef struct server {
     volatile sig_atomic_t should_stop;
     socket_queue_t *queue;
     thread_pool_t pool;
+    access_log_t *access_log;
 } server_t;
 
 int server_init(server_t *server, const server_config_t *config);

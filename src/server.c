@@ -5,7 +5,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +15,11 @@
 typedef struct {
     server_t *server;
 } worker_context_t;
+
+typedef struct {
+    int status_code;
+    size_t body_bytes;
+} response_result_t;
 
 static int send_all(int fd, const void *buffer, size_t length) {
     const char *data = buffer;
@@ -36,24 +40,48 @@ static int send_all(int fd, const void *buffer, size_t length) {
     return 0;
 }
 
-static int send_simple_response(int fd, int status, const char *body) {
+static int extract_request_line(const char *buffer, char *request_line, size_t request_line_size) {
+    const char *line_end = strstr(buffer, "\r\n");
+    size_t line_len;
+
+    if (buffer == NULL || request_line == NULL || request_line_size == 0) {
+        return -1;
+    }
+
+    line_len = line_end == NULL ? strlen(buffer) : (size_t)(line_end - buffer);
+    if (line_len >= request_line_size) {
+        line_len = request_line_size - 1;
+    }
+    memcpy(request_line, buffer, line_len);
+    request_line[line_len] = '\0';
+    return 0;
+}
+
+static int send_simple_response(int fd, int status, const char *body, int keep_alive, response_result_t *result) {
     char headers[RESPONSE_BUFFER_SIZE];
     size_t body_len = strlen(body);
     int header_len = snprintf(headers, sizeof(headers),
                               "HTTP/1.1 %d %s\r\n"
                               "Content-Type: text/plain\r\n"
                               "Content-Length: %zu\r\n"
-                              "Connection: close\r\n"
+                              "Connection: %s\r\n"
                               "\r\n",
-                              status, http_status_text(status), body_len);
+                              status, http_status_text(status), body_len, keep_alive ? "keep-alive" : "close");
     if (header_len < 0 || (size_t)header_len >= sizeof(headers)) {
         return -1;
     }
-    return send_all(fd, headers, (size_t)header_len) == 0 &&
-           send_all(fd, body, body_len) == 0 ? 0 : -1;
+    if (send_all(fd, headers, (size_t)header_len) != 0 ||
+        send_all(fd, body, body_len) != 0) {
+        return -1;
+    }
+    if (result != NULL) {
+        result->status_code = status;
+        result->body_bytes = body_len;
+    }
+    return 0;
 }
 
-static int send_file_response(int fd, const http_request_t *request, const file_info_t *info) {
+static int send_file_response(int fd, const http_request_t *request, const file_info_t *info, int keep_alive, response_result_t *result) {
     FILE *file = fopen(info->resolved_path, "rb");
     char headers[RESPONSE_BUFFER_SIZE];
     char buffer[READ_BUFFER_SIZE];
@@ -61,16 +89,16 @@ static int send_file_response(int fd, const http_request_t *request, const file_
     int header_len;
 
     if (file == NULL) {
-        return send_simple_response(fd, 500, "Internal Server Error\n");
+        return send_simple_response(fd, 500, "Internal Server Error\n", 0, result);
     }
 
     header_len = snprintf(headers, sizeof(headers),
                           "HTTP/1.1 200 OK\r\n"
                           "Content-Type: %s\r\n"
                           "Content-Length: %zu\r\n"
-                          "Connection: close\r\n"
+                          "Connection: %s\r\n"
                           "\r\n",
-                          info->mime_type, info->size);
+                          info->mime_type, info->size, keep_alive ? "keep-alive" : "close");
     if (header_len < 0 || (size_t)header_len >= sizeof(headers) ||
         send_all(fd, headers, (size_t)header_len) != 0) {
         fclose(file);
@@ -79,6 +107,10 @@ static int send_file_response(int fd, const http_request_t *request, const file_
 
     if (request->method == HTTP_METHOD_HEAD) {
         fclose(file);
+        if (result != NULL) {
+            result->status_code = 200;
+            result->body_bytes = 0;
+        }
         return 0;
     }
 
@@ -97,34 +129,49 @@ static int send_file_response(int fd, const http_request_t *request, const file_
     }
 
     fclose(file);
+    if (result != NULL) {
+        result->status_code = 200;
+        result->body_bytes = info->size;
+    }
     return 0;
 }
 
-static int send_directory_response(int fd, const http_request_t *request, const file_info_t *info) {
+static int send_directory_response(int fd, const http_request_t *request, const file_info_t *info, int keep_alive, response_result_t *result) {
     char body[RESPONSE_BUFFER_SIZE];
     char headers[RESPONSE_BUFFER_SIZE];
     size_t body_len = 0;
     int header_len;
 
     if (file_build_directory_listing(request->path, info->resolved_path, body, sizeof(body), &body_len) != FILE_RESULT_OK) {
-        return send_simple_response(fd, 500, "Internal Server Error\n");
+        return send_simple_response(fd, 500, "Internal Server Error\n", 0, result);
     }
 
     header_len = snprintf(headers, sizeof(headers),
                           "HTTP/1.1 200 OK\r\n"
                           "Content-Type: text/html\r\n"
                           "Content-Length: %zu\r\n"
-                          "Connection: close\r\n"
+                          "Connection: %s\r\n"
                           "\r\n",
-                          body_len);
+                          body_len, keep_alive ? "keep-alive" : "close");
     if (header_len < 0 || (size_t)header_len >= sizeof(headers) ||
         send_all(fd, headers, (size_t)header_len) != 0) {
         return -1;
     }
     if (request->method == HTTP_METHOD_HEAD) {
+        if (result != NULL) {
+            result->status_code = 200;
+            result->body_bytes = 0;
+        }
         return 0;
     }
-    return send_all(fd, body, body_len);
+    if (send_all(fd, body, body_len) != 0) {
+        return -1;
+    }
+    if (result != NULL) {
+        result->status_code = 200;
+        result->body_bytes = body_len;
+    }
+    return 0;
 }
 
 static int status_from_file_result(file_result_t result) {
@@ -142,44 +189,58 @@ static void handle_client(int client_fd, void *context) {
     worker_context_t *worker_context = context;
     server_t *server = worker_context->server;
     char buffer[READ_BUFFER_SIZE + 1];
-    ssize_t received;
+    char request_line[256];
     http_request_t request;
     file_info_t info;
     file_result_t file_result;
+    int keep_going = 1;
 
-    received = recv(client_fd, buffer, READ_BUFFER_SIZE, 0);
-    if (received <= 0) {
-        close(client_fd);
-        return;
-    }
-    buffer[received] = '\0';
+    while (keep_going) {
+        ssize_t received = recv(client_fd, buffer, READ_BUFFER_SIZE, 0);
+        response_result_t response = {0, 0};
 
-    if (http_parse_request(buffer, (size_t)received, &request) != HTTP_PARSE_OK) {
-        send_simple_response(client_fd, 400, "Bad Request\n");
-        close(client_fd);
-        return;
-    }
+        if (received <= 0) {
+            break;
+        }
+        buffer[received] = '\0';
+        extract_request_line(buffer, request_line, sizeof(request_line));
 
-    if (request.method == HTTP_METHOD_UNSUPPORTED) {
-        send_simple_response(client_fd, 501, "Not Implemented\n");
-        close(client_fd);
-        return;
-    }
+        if (http_parse_request(buffer, (size_t)received, &request) != HTTP_PARSE_OK) {
+            send_simple_response(client_fd, 400, "Bad Request\n", 0, &response);
+            access_log_write(server->access_log, "127.0.0.1", request_line, response.status_code, response.body_bytes);
+            break;
+        }
 
-    file_result = file_stat_path(server->config.doc_root, request.path, &info);
-    if (file_result != FILE_RESULT_OK) {
-        int status = status_from_file_result(file_result);
-        char body[128];
-        snprintf(body, sizeof(body), "%d %s\n", status, http_status_text(status));
-        send_simple_response(client_fd, status, body);
-        close(client_fd);
-        return;
-    }
+        keep_going = http_should_keep_alive(&request);
 
-    if (info.kind == FILE_KIND_DIRECTORY) {
-        send_directory_response(client_fd, &request, &info);
-    } else {
-        send_file_response(client_fd, &request, &info);
+        if (request.method == HTTP_METHOD_UNSUPPORTED) {
+            send_simple_response(client_fd, 501, "Not Implemented\n", keep_going, &response);
+            access_log_write(server->access_log, "127.0.0.1", request_line, response.status_code, response.body_bytes);
+            if (!keep_going) {
+                break;
+            }
+            continue;
+        }
+
+        file_result = file_stat_path(server->config.doc_root, request.path, &info);
+        if (file_result != FILE_RESULT_OK) {
+            int status = status_from_file_result(file_result);
+            char body[128];
+            snprintf(body, sizeof(body), "%d %s\n", status, http_status_text(status));
+            send_simple_response(client_fd, status, body, keep_going, &response);
+            access_log_write(server->access_log, "127.0.0.1", request_line, response.status_code, response.body_bytes);
+            if (!keep_going) {
+                break;
+            }
+            continue;
+        }
+
+        if (info.kind == FILE_KIND_DIRECTORY) {
+            send_directory_response(client_fd, &request, &info, keep_going, &response);
+        } else {
+            send_file_response(client_fd, &request, &info, keep_going, &response);
+        }
+        access_log_write(server->access_log, "127.0.0.1", request_line, response.status_code, response.body_bytes);
     }
 
     close(client_fd);
@@ -233,9 +294,17 @@ int server_init(server_t *server, const server_config_t *config) {
         return -1;
     }
 
+    if (access_log_open(&server->access_log, config->access_log) != 0) {
+        socket_queue_destroy(server->queue);
+        server->queue = NULL;
+        return -1;
+    }
+
     server->listen_fd = create_listening_socket(config);
     if (server->listen_fd < 0) {
+        access_log_close(server->access_log);
         socket_queue_destroy(server->queue);
+        server->access_log = NULL;
         server->queue = NULL;
         return -1;
     }
@@ -295,6 +364,8 @@ void server_destroy(server_t *server) {
         close(server->listen_fd);
         server->listen_fd = -1;
     }
+    access_log_close(server->access_log);
+    server->access_log = NULL;
     socket_queue_destroy(server->queue);
     server->queue = NULL;
 }
