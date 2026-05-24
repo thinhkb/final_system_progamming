@@ -1,0 +1,7 @@
+httpd
+access.log
+src/*.o
+tests/*.o
+tests/unit_http
+tests/unit_files
+tests/unit_thread_pool
