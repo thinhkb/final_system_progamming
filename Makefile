@@ -2,7 +2,9 @@ CC := gcc
 CFLAGS := -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -Iinclude
 LDFLAGS := -pthread
 
-SRC := src/main.c
+SRC := src/main.c src/http.c
+COMMON_SRC := src/http.c
+TEST_HTTP_SRC := tests/unit_http.c $(COMMON_SRC)
 OBJ := $(SRC:.c=.o)
 BIN := httpd
 
@@ -18,8 +20,11 @@ $(BIN): $(OBJ)
 
 test: test-unit test-integration
 
-test-unit:
-	@echo "unit tests will be added in later tasks"
+tests/unit_http: $(TEST_HTTP_SRC)
+	$(CC) $(CFLAGS) -o $@ $(TEST_HTTP_SRC) $(LDFLAGS)
+
+test-unit: tests/unit_http
+	./tests/unit_http
 
 test-integration:
 	@echo "integration tests will be added in later tasks"
