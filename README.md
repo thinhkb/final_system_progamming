@@ -2,7 +2,7 @@
 
 Final project for System Programming, option A3: HTTP file server.
 
-This project implements a multi-threaded HTTP/1.0 and HTTP/1.1 static file server in C. It serves files from a document root, supports Keep-Alive, MIME types, directory listings, Common Log Format access logs, and a fixed worker thread pool with a bounded producer-consumer queue.
+This project implements a multi-threaded HTTP/1.0 and HTTP/1.1 static file server in C. It serves files from a document root, supports Keep-Alive, MIME types, directory listings, byte-range requests, Common Log Format access logs, and a fixed worker thread pool with a bounded producer-consumer queue.
 
 ## Group Members
 
@@ -16,14 +16,17 @@ Fill in the real submission information before handing in the project.
 
 ## Build
 
+If you already have old build artifacts from another machine or OS, rebuild from scratch:
+
 ```bash
+make clean
 make
 ```
 
 The build uses:
 
 ```bash
-gcc -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L
+gcc -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
 ```
 
 ## Run
@@ -49,9 +52,11 @@ Options:
 curl http://127.0.0.1:8080/index.html
 curl -I http://127.0.0.1:8080/about.txt
 curl http://127.0.0.1:8080/listing/
+curl -r 0-31 http://127.0.0.1:8080/about.txt
+curl http://127.0.0.1:8080/index.html?cache=false
 ```
 
-Unsupported methods return `501 Not Implemented`, missing files return `404 Not Found`, and path traversal attempts return `403 Forbidden`.
+Unsupported methods return `501 Not Implemented`, missing files return `404 Not Found`, path traversal attempts return `403 Forbidden`, and unsatisfiable ranges return `416 Range Not Satisfiable`.
 
 ## Testing
 
@@ -67,6 +72,8 @@ The test suite includes:
 - filesystem and path-safety unit tests
 - bounded queue unit tests
 - black-box integration tests using `curl`
+- byte-range response checks
+- URL-encoded directory-listing links
 - a 120-client concurrent stress check
 
 ## Benchmark
@@ -82,7 +89,7 @@ The target starts the server on port `18080`, runs 120 concurrent requests again
 The benchmark script can also be run against an already-running server:
 
 ```bash
-./bench/bench.sh 127.0.0.1 8080 /index.html 120
+bash ./bench/bench.sh 127.0.0.1 8080 /index.html 120
 ```
 
 ## Source Tree

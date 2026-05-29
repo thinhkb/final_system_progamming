@@ -1,5 +1,5 @@
 CC := gcc
-CFLAGS := -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -Iinclude
+CFLAGS := -std=c11 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Iinclude
 LDFLAGS := -pthread
 
 SRC := src/main.c src/http.c src/files.c src/thread_pool.c src/server.c src/log.c
@@ -37,7 +37,7 @@ test-unit: tests/unit_http tests/unit_files tests/unit_thread_pool
 	./tests/unit_thread_pool
 
 test-integration:
-	./tests/run_tests.sh
+	bash ./tests/run_tests.sh
 
 bench: all
 	@set -e; \
@@ -45,7 +45,7 @@ bench: all
 	server_pid=$$!; \
 	trap 'kill $$server_pid 2>/dev/null || true; wait $$server_pid 2>/dev/null || true' EXIT; \
 	sleep 1; \
-	./bench/bench.sh 127.0.0.1 18080 /index.html 120
+	bash ./bench/bench.sh 127.0.0.1 18080 /index.html 120
 
 clean:
 	rm -f $(BIN) src/*.o tests/*.o tests/unit_http tests/unit_files tests/unit_thread_pool access.log

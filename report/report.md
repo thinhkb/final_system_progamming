@@ -80,9 +80,9 @@ The program is written in C11 and uses POSIX APIs. The build uses `gcc` with `-W
 
 The acceptor thread calls `accept` in a loop and enqueues client sockets. If the bounded queue is full, the socket is closed immediately. Worker threads call `socket_queue_dequeue`, process the client connection, and return to the queue for more work. Queue synchronization uses `pthread_mutex_t` and condition variables.
 
-Request parsing is deliberately simple and strict. The parser extracts the method, path, version, and `Connection` header. It supports `GET` and `HEAD`; other methods are parsed but answered with `501 Not Implemented`. Bad request lines return `400 Bad Request`.
+Request parsing is deliberately simple and strict. The parser extracts the method, path, version, `Connection`, and single byte `Range` headers. It supports `GET` and `HEAD`; other methods are parsed but answered with `501 Not Implemented`. Bad request lines return `400 Bad Request`.
 
-The filesystem module maps file extensions to MIME types and verifies that requested files remain under the configured document root. Regular files are streamed in chunks. Directories are rendered as small HTML pages listing visible entries. `HEAD` requests return headers without a response body.
+The filesystem module maps file extensions to MIME types and verifies that requested files remain under the configured document root. Regular files are streamed in chunks, and byte ranges return `206 Partial Content` or `416 Range Not Satisfiable` when the requested range cannot be served. Directories are rendered as generated HTML pages with escaped text and URL-encoded links. `HEAD` requests return headers without a response body.
 
 The logging module writes one line per completed request in Common Log Format. It uses a mutex around file writes because multiple workers may complete requests at the same time.
 
@@ -104,6 +104,7 @@ Integration tests cover:
 - `403 Forbidden` for traversal attempts
 - CSS MIME type
 - directory listings
+- byte-range requests
 - unsupported methods returning `501`
 - two HTTP/1.1 requests over one Keep-Alive connection
 - access log output
@@ -127,7 +128,7 @@ Future optimizations could include sendfile-based file transfer, per-worker log 
 
 The project successfully demonstrates a realistic concurrent network server in C. It integrates sockets, pthreads, synchronization, HTTP parsing, filesystem safety, logging, tests, and benchmarking.
 
-Future work could add range requests, stronger URL decoding, configurable directory-listing style, HTTP date headers, improved timeout handling, and support for larger generated directory listings.
+Future work could add configurable directory-listing style, HTTP date headers, improved timeout handling, multi-range responses, and stronger validation for unusual request-target forms.
 
 ## 8. References
 

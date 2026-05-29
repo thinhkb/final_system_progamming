@@ -8,49 +8,200 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int append_text(char *buffer, size_t buffer_size, size_t *written, const char *text) {
-    size_t length = strlen(text);
-    if (*written + length >= buffer_size) {
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} string_builder_t;
+
+typedef struct {
+    char *name;
+    int is_directory;
+} directory_entry_t;
+
+static void builder_destroy(string_builder_t *builder) {
+    if (builder == NULL) {
+        return;
+    }
+    free(builder->data);
+    builder->data = NULL;
+    builder->length = 0;
+    builder->capacity = 0;
+}
+
+static int builder_reserve(string_builder_t *builder, size_t additional) {
+    size_t required;
+    size_t new_capacity;
+    char *grown;
+
+    if (builder == NULL) {
         return 0;
     }
-    memcpy(buffer + *written, text, length);
-    *written += length;
-    buffer[*written] = '\0';
+
+    if (additional > ((size_t)-1) - builder->length - 1) {
+        return 0;
+    }
+    required = builder->length + additional + 1;
+    if (required <= builder->capacity) {
+        return 1;
+    }
+
+    new_capacity = builder->capacity == 0 ? 1024 : builder->capacity;
+    while (new_capacity < required) {
+        if (new_capacity > ((size_t)-1) / 2) {
+            new_capacity = required;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    grown = realloc(builder->data, new_capacity);
+    if (grown == NULL) {
+        return 0;
+    }
+
+    builder->data = grown;
+    builder->capacity = new_capacity;
     return 1;
 }
 
-static int append_escaped(char *buffer, size_t buffer_size, size_t *written, const char *text) {
+static int builder_append_text(string_builder_t *builder, const char *text) {
+    size_t length = strlen(text);
+
+    if (!builder_reserve(builder, length)) {
+        return 0;
+    }
+
+    memcpy(builder->data + builder->length, text, length);
+    builder->length += length;
+    builder->data[builder->length] = '\0';
+    return 1;
+}
+
+static int builder_append_char(string_builder_t *builder, char ch) {
+    if (!builder_reserve(builder, 1)) {
+        return 0;
+    }
+
+    builder->data[builder->length++] = ch;
+    builder->data[builder->length] = '\0';
+    return 1;
+}
+
+static int builder_append_html_escaped(string_builder_t *builder, const char *text) {
     for (const char *p = text; *p != '\0'; p++) {
         switch (*p) {
             case '&':
-                if (!append_text(buffer, buffer_size, written, "&amp;")) {
+                if (!builder_append_text(builder, "&amp;")) {
                     return 0;
                 }
                 break;
             case '<':
-                if (!append_text(buffer, buffer_size, written, "&lt;")) {
+                if (!builder_append_text(builder, "&lt;")) {
                     return 0;
                 }
                 break;
             case '>':
-                if (!append_text(buffer, buffer_size, written, "&gt;")) {
+                if (!builder_append_text(builder, "&gt;")) {
                     return 0;
                 }
                 break;
             case '"':
-                if (!append_text(buffer, buffer_size, written, "&quot;")) {
+                if (!builder_append_text(builder, "&quot;")) {
                     return 0;
                 }
                 break;
-            default: {
-                char one[2] = {*p, '\0'};
-                if (!append_text(buffer, buffer_size, written, one)) {
+            default:
+                if (!builder_append_char(builder, *p)) {
                     return 0;
                 }
                 break;
+        }
+    }
+    return 1;
+}
+
+static int is_url_unreserved(unsigned char ch) {
+    return isalnum(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~';
+}
+
+static int builder_append_url_escaped(string_builder_t *builder, const char *text) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+        if (is_url_unreserved(*p)) {
+            if (!builder_append_char(builder, (char)*p)) {
+                return 0;
+            }
+        } else {
+            char encoded[4];
+            encoded[0] = '%';
+            encoded[1] = hex[*p >> 4];
+            encoded[2] = hex[*p & 0x0f];
+            encoded[3] = '\0';
+            if (!builder_append_text(builder, encoded)) {
+                return 0;
             }
         }
     }
+
+    return 1;
+}
+
+static char *duplicate_string(const char *text) {
+    size_t length = strlen(text);
+    char *copy = malloc(length + 1);
+
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, text, length + 1);
+    return copy;
+}
+
+static int compare_directory_entries(const void *left, const void *right) {
+    const directory_entry_t *left_entry = left;
+    const directory_entry_t *right_entry = right;
+    return strcmp(left_entry->name, right_entry->name);
+}
+
+static void free_directory_entries(directory_entry_t *entries, size_t entry_count) {
+    if (entries == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < entry_count; i++) {
+        free(entries[i].name);
+    }
+    free(entries);
+}
+
+static int append_directory_entry(directory_entry_t **entries, size_t *entry_count, size_t *entry_capacity,
+                                  const char *name, int is_directory) {
+    directory_entry_t *grown;
+
+    if (*entry_count == *entry_capacity) {
+        size_t new_capacity = *entry_capacity == 0 ? 16 : *entry_capacity * 2;
+        if (new_capacity < *entry_capacity) {
+            return 0;
+        }
+
+        grown = realloc(*entries, new_capacity * sizeof(**entries));
+        if (grown == NULL) {
+            return 0;
+        }
+
+        *entries = grown;
+        *entry_capacity = new_capacity;
+    }
+
+    (*entries)[*entry_count].name = duplicate_string(name);
+    if ((*entries)[*entry_count].name == NULL) {
+        return 0;
+    }
+    (*entries)[*entry_count].is_directory = is_directory;
+    (*entry_count)++;
     return 1;
 }
 
@@ -249,50 +400,82 @@ file_result_t file_stat_path(const char *doc_root, const char *request_path, fil
     return FILE_RESULT_FORBIDDEN;
 }
 
-file_result_t file_build_directory_listing(const char *request_path, const char *resolved_path, char *buffer, size_t buffer_size, size_t *written) {
+file_result_t file_build_directory_listing(const char *request_path, const char *resolved_path, char **body, size_t *body_len) {
     DIR *directory;
     struct dirent *entry;
-    size_t used = 0;
+    directory_entry_t *entries = NULL;
+    size_t entry_count = 0;
+    size_t entry_capacity = 0;
+    string_builder_t builder = {0};
 
-    if (request_path == NULL || resolved_path == NULL || buffer == NULL || written == NULL || buffer_size == 0) {
+    if (request_path == NULL || resolved_path == NULL || body == NULL || body_len == NULL) {
         return FILE_RESULT_ERROR;
     }
+
+    *body = NULL;
+    *body_len = 0;
 
     directory = opendir(resolved_path);
     if (directory == NULL) {
         return FILE_RESULT_ERROR;
     }
 
-    buffer[0] = '\0';
-    if (!append_text(buffer, buffer_size, &used, "<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of ") ||
-        !append_escaped(buffer, buffer_size, &used, request_path) ||
-        !append_text(buffer, buffer_size, &used, "</title></head><body><h1>Index of ") ||
-        !append_escaped(buffer, buffer_size, &used, request_path) ||
-        !append_text(buffer, buffer_size, &used, "</h1><ul>")) {
-        closedir(directory);
-        return FILE_RESULT_ERROR;
-    }
-
     while ((entry = readdir(directory)) != NULL) {
+        char child_path[FILE_PATH_MAX];
+        struct stat st;
+        int is_directory = 0;
+
         if (entry->d_name[0] == '.') {
             continue;
         }
-        if (!append_text(buffer, buffer_size, &used, "<li><a href=\"") ||
-            !append_escaped(buffer, buffer_size, &used, entry->d_name) ||
-            !append_text(buffer, buffer_size, &used, "\">") ||
-            !append_escaped(buffer, buffer_size, &used, entry->d_name) ||
-            !append_text(buffer, buffer_size, &used, "</a></li>")) {
+
+        if (snprintf(child_path, sizeof(child_path), "%s/%s", resolved_path, entry->d_name) < (int)sizeof(child_path) &&
+            stat(child_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            is_directory = 1;
+        }
+
+        if (!append_directory_entry(&entries, &entry_count, &entry_capacity, entry->d_name, is_directory)) {
             closedir(directory);
+            free_directory_entries(entries, entry_count);
             return FILE_RESULT_ERROR;
         }
     }
 
     closedir(directory);
+    qsort(entries, entry_count, sizeof(*entries), compare_directory_entries);
 
-    if (!append_text(buffer, buffer_size, &used, "</ul></body></html>")) {
+    if (!builder_append_text(&builder, "<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of ") ||
+        !builder_append_html_escaped(&builder, request_path) ||
+        !builder_append_text(&builder, "</title></head><body><h1>Index of ") ||
+        !builder_append_html_escaped(&builder, request_path) ||
+        !builder_append_text(&builder, "</h1><ul>")) {
+        free_directory_entries(entries, entry_count);
+        builder_destroy(&builder);
         return FILE_RESULT_ERROR;
     }
 
-    *written = used;
+    for (size_t i = 0; i < entry_count; i++) {
+        if (!builder_append_text(&builder, "<li><a href=\"") ||
+            !builder_append_url_escaped(&builder, entries[i].name) ||
+            (entries[i].is_directory && !builder_append_char(&builder, '/')) ||
+            !builder_append_text(&builder, "\">") ||
+            !builder_append_html_escaped(&builder, entries[i].name) ||
+            (entries[i].is_directory && !builder_append_char(&builder, '/')) ||
+            !builder_append_text(&builder, "</a></li>")) {
+            free_directory_entries(entries, entry_count);
+            builder_destroy(&builder);
+            return FILE_RESULT_ERROR;
+        }
+    }
+
+    free_directory_entries(entries, entry_count);
+
+    if (!builder_append_text(&builder, "</ul></body></html>")) {
+        builder_destroy(&builder);
+        return FILE_RESULT_ERROR;
+    }
+
+    *body = builder.data;
+    *body_len = builder.length;
     return FILE_RESULT_OK;
 }

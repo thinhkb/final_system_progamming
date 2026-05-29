@@ -50,12 +50,46 @@ static int test_connection_close_disables_keep_alive(void) {
     return 0;
 }
 
+static int test_parse_explicit_range(void) {
+    http_request_t request;
+    const char *raw = "GET /about.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=7-10\r\n\r\n";
+    ASSERT_TRUE(http_parse_request(raw, strlen(raw), &request) == HTTP_PARSE_OK);
+    ASSERT_TRUE(request.has_range);
+    ASSERT_TRUE(!request.range_is_suffix);
+    ASSERT_TRUE(request.range_start == 7);
+    ASSERT_TRUE(request.range_end_provided);
+    ASSERT_TRUE(request.range_end == 10);
+    return 0;
+}
+
+static int test_parse_suffix_range(void) {
+    http_request_t request;
+    const char *raw = "GET /about.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=-5\r\n\r\n";
+    ASSERT_TRUE(http_parse_request(raw, strlen(raw), &request) == HTTP_PARSE_OK);
+    ASSERT_TRUE(request.has_range);
+    ASSERT_TRUE(request.range_is_suffix);
+    ASSERT_TRUE(request.range_start == 5);
+    ASSERT_TRUE(!request.range_end_provided);
+    return 0;
+}
+
+static int test_parse_ignores_query_string(void) {
+    http_request_t request;
+    const char *raw = "GET /index.html?cache=false HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ASSERT_TRUE(http_parse_request(raw, strlen(raw), &request) == HTTP_PARSE_OK);
+    ASSERT_STR_EQ(request.path, "/index.html");
+    return 0;
+}
+
 int main(void) {
     ASSERT_TRUE(test_parse_get_http11() == 0);
     ASSERT_TRUE(test_parse_head_http10_keep_alive() == 0);
     ASSERT_TRUE(test_parse_unsupported_method() == 0);
     ASSERT_TRUE(test_parse_bad_request() == 0);
     ASSERT_TRUE(test_connection_close_disables_keep_alive() == 0);
+    ASSERT_TRUE(test_parse_explicit_range() == 0);
+    ASSERT_TRUE(test_parse_suffix_range() == 0);
+    ASSERT_TRUE(test_parse_ignores_query_string() == 0);
     puts("unit_http: PASS");
     return 0;
 }

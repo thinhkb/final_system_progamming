@@ -27,6 +27,6 @@ typedef struct {
 const char *file_mime_type(const char *path);
 file_result_t file_resolve_path(const char *doc_root, const char *request_path, char *resolved, size_t resolved_size);
 file_result_t file_stat_path(const char *doc_root, const char *request_path, file_info_t *info);
-file_result_t file_build_directory_listing(const char *request_path, const char *resolved_path, char *buffer, size_t buffer_size, size_t *written);
+file_result_t file_build_directory_listing(const char *request_path, const char *resolved_path, char **body, size_t *body_len);
 
 #endif

@@ -33,6 +33,11 @@ typedef struct {
     http_method_t method;
     http_version_t version;
     int keep_alive_requested;
+    int has_range;
+    int range_is_suffix;
+    int range_end_provided;
+    size_t range_start;
+    size_t range_end;
 } http_request_t;
 
 http_parse_result_t http_parse_request(const char *raw, size_t length, http_request_t *request);
