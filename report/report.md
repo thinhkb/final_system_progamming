@@ -1,5 +1,15 @@
 # Technical Report: Multi-Threaded HTTP File Server
 
+**Full implementation details are available in the companion phase reports:**
+- [01 - HTTP Protocol & Keep-Alive (EN)](01-http-protocol-en.md) | [(VI)](01-http-protocol-vi.md)
+- [02 - Thread Pool Architecture (EN)](02-thread-pool-en.md) | [(VI)](02-thread-pool-vi.md)
+- [03 - File System & Security (EN)](03-filesystem-en.md) | [(VI)](03-filesystem-vi.md)
+- [04 - Access Logging (EN)](04-access-log-en.md) | [(VI)](04-access-log-vi.md)
+- [05 - Range Requests (EN)](05-range-requests-en.md) | [(VI)](05-range-requests-vi.md)
+- [06 - Testing & Benchmarking (EN)](06-testing-en.md) | [(VI)](06-testing-vi.md)
+
+---
+
 ## 1. Introduction
 
 This project implements a multi-threaded HTTP file server in C for the System Programming final project. The server accepts TCP connections, parses HTTP/1.0 and HTTP/1.1 requests, serves static files from a document root, generates directory listings, records access logs, and handles concurrent clients using a fixed thread pool.
@@ -118,11 +128,33 @@ make test
 
 ## 6. Performance Analysis
 
-The benchmark script starts many concurrent clients using `curl` and reports success count, failure count, elapsed time, and approximate requests per second. A typical local run completed 120 successful requests with zero failures in under one second.
+The benchmark script starts many concurrent clients using `curl` and reports success count, failure count, elapsed time, and approximate requests per second.
+
+To run the benchmark:
+
+```bash
+make bench
+```
+
+The benchmark:
+1. Starts the server on port `18080` with 8 worker threads and queue capacity 128
+2. Runs `bench/bench.sh` with 120 concurrent `curl` clients fetching `/index.html`
+3. Reports: successes, failures, elapsed milliseconds, and requests per second
+4. Asserts that failures equal zero
+
+**Benchmark Results** *(run `make bench` and fill in actual values):*
+
+| Metric | Value |
+|---|---|
+| Concurrent clients | 120 |
+| Successes | _TODO_ |
+| Failures | _TODO_ (expected: 0) |
+| Elapsed time (ms) | _TODO_ |
+| Requests per second | _TODO_ |
 
 The fixed thread pool prevents unbounded thread creation. The bounded queue avoids unlimited memory growth during bursts. The largest bottlenecks are file I/O, one-thread-per-active-connection handling during Keep-Alive, and the simple access-log mutex. These trade-offs are acceptable for the project scope and make the implementation understandable and testable.
 
-Future optimizations could include sendfile-based file transfer, per-worker log buffering, configurable socket timeouts, and an event-driven architecture for very high numbers of idle Keep-Alive clients.
+Future optimizations could include `sendfile`-based file transfer, per-worker log buffering, configurable socket timeouts, and an event-driven architecture for very high numbers of idle Keep-Alive clients.
 
 ## 7. Conclusion & Future Work
 
