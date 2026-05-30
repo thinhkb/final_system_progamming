@@ -6,7 +6,7 @@ This project implements a multi-threaded HTTP/1.0 and HTTP/1.1 static file serve
 
 ## Group Members
 
-Fill in the real submission information before handing in the project.
+> **TODO:** Replace the placeholder entries below with your real group member information before submission.
 
 | Full name | Student ID | Email |
 | --- | --- | --- |
@@ -110,8 +110,16 @@ bash ./bench/bench.sh 127.0.0.1 8080 /index.html 120
 
 ## Individual Contributions
 
-Update this section with the real work split.
+> **TODO:** Update this section to reflect actual work distribution among group members.
 
-- Member 1: server architecture, socket lifecycle, and request handling.
-- Member 2: HTTP parsing, filesystem safety, MIME handling, and directory listings.
-- Member 3: testing, benchmark script, documentation, and report preparation.
+The project was structured as a modular implementation with the following areas:
+
+| Area | Description |
+|---|---|
+| Server core | Listening socket setup, accept loop, client dispatch, signal handling |
+| HTTP parsing | Request line and header parsing, method/version handling, keep-alive logic |
+| Thread pool | Bounded producer-consumer queue, fixed worker thread pool, shutdown coordination |
+| Filesystem | Safe path resolution, MIME type lookup, directory listing generation |
+| Access logging | Thread-safe Common Log Format logging |
+| Testing | Unit tests, integration tests, benchmark script |
+| Documentation | Technical report, phase reports, README |

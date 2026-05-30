@@ -66,4 +66,11 @@ keep_alive_response=$(
 [[ "$(grep -c "HTTP/1.1 200 OK" <<< "${keep_alive_response}")" -eq 2 ]]
 
 grep -q '"GET /index.html HTTP/1.1" 200' access.log
+
+# New MIME type integration tests
+curl -fsSI "${BASE_URL}/test.xml" | grep -qi "^Content-Type: application/xml"
+curl -fsSI "${BASE_URL}/data.csv" | grep -qi "^Content-Type: text/csv"
+curl -fsSI "${BASE_URL}/fonts/sample.woff" | grep -qi "^Content-Type: font/woff"
+curl -fsSI "${BASE_URL}/sample.pdf" | grep -qi "^Content-Type: application/pdf"
+
 bash ./bench/bench.sh "${HOST}" "${PORT}" /index.html 120
