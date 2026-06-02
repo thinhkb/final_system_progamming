@@ -1,0 +1,1592 @@
+<h1
+id="technical-report-design-and-implementation-of-a-multi-threaded-http-file-server-in-c">Technical
+Report: Design and Implementation of a Multi-Threaded HTTP File Server
+in C</h1>
+<p><strong>Course:</strong> System Programming — Final Project (Option
+A3) <strong>Date:</strong> May 2026 <strong>Language:</strong> C11 /
+POSIX</p>
+<hr />
+<h2 id="abstract">Abstract</h2>
+<p>This report presents the design, implementation, and evaluation of a
+multi-threaded HTTP file server written in C11 using the POSIX API. The
+server accepts TCP connections, parses HTTP/1.0 and HTTP/1.1 requests,
+serves static files from a configurable document root, generates HTML
+directory listings, supports byte-range requests for partial content
+delivery, and records every completed request in the Common Log Format.
+Concurrency is achieved through a fixed-size thread pool backed by a
+bounded producer-consumer queue implemented as a circular buffer with
+mutex and condition variable synchronization. The filesystem layer
+employs a five-stage path validation pipeline — URL decoding, dot-dot
+segment rejection, path joining, canonical resolution via
+<code>realpath(3)</code>, and chroot-style prefix verification — to
+defend against path traversal attacks. The project is validated through
+16 unit tests covering the HTTP parser, filesystem resolver, and thread
+pool queue, complemented by 15 integration tests exercising the running
+server with <code>curl</code> and <code>netcat</code>, and a concurrent
+benchmark that confirms zero failures under 120 simultaneous clients.
+This report describes the theoretical background, architectural
+decisions, implementation details, security considerations, testing
+methodology, and performance characteristics of the server, and
+concludes with a discussion of limitations and directions for future
+work.</p>
+<hr />
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol type="1">
+<li><a href="#1-introduction">Introduction</a></li>
+<li><a href="#2-background-and-theoretical-foundations">Background and
+Theoretical Foundations</a></li>
+<li><a href="#3-system-architecture-and-design">System Architecture and
+Design</a></li>
+<li><a href="#4-http-protocol-implementation">HTTP Protocol
+Implementation</a></li>
+<li><a href="#5-thread-pool-and-concurrency-architecture">Thread Pool
+and Concurrency Architecture</a></li>
+<li><a href="#6-file-system-layer-and-security">File System Layer and
+Security</a></li>
+<li><a href="#7-access-logging-subsystem">Access Logging
+Subsystem</a></li>
+<li><a href="#8-http-range-request-support">HTTP Range Request
+Support</a></li>
+<li><a href="#9-testing-and-validation-strategy">Testing and Validation
+Strategy</a></li>
+<li><a href="#10-performance-analysis-and-benchmarking">Performance
+Analysis and Benchmarking</a></li>
+<li><a href="#11-conclusion-and-future-work">Conclusion and Future
+Work</a></li>
+<li><a href="#12-references">References</a></li>
+<li><a href="#13-appendices">Appendices</a></li>
+</ol>
+<hr />
+<h2 id="introduction">1. Introduction</h2>
+<h3 id="problem-statement">1.1 Problem Statement</h3>
+<p>Modern web infrastructure is built upon HTTP servers — programs that
+listen for incoming TCP connections, parse textual HTTP requests, and
+return structured responses containing status codes, headers, and
+content bodies. Production-grade servers such as Apache httpd and Nginx
+have evolved over more than two decades to include sophisticated
+features including TLS termination, reverse proxying, load balancing,
+content caching, and event-driven I/O multiplexing. Despite this
+complexity, the fundamental principles underlying every HTTP server
+remain firmly rooted in the domain of system programming: socket-based
+network I/O, multi-threaded or multi-process concurrency, filesystem
+interaction through POSIX APIs, inter-thread synchronization using
+mutexes and condition variables, and safe handling of untrusted input
+from the network.</p>
+<p>This project implements a multi-threaded HTTP file server in the C
+programming language as the final project for the System Programming
+course. The server accepts TCP connections on a configurable port,
+parses both HTTP/1.0 and HTTP/1.1 requests with correct version-specific
+connection semantics, serves static files from a designated document
+root directory, generates dynamically built HTML directory listings when
+a directory is requested, records every completed request in the Common
+Log Format used by major web servers, supports byte-range requests for
+partial file retrieval as specified in RFC 9110, and handles concurrent
+clients through a fixed-size thread pool backed by a bounded
+producer-consumer queue. Together, these features exercise a broad
+cross-section of system programming topics in a single, cohesive, and
+realistic application.</p>
+<h3 id="motivation-and-significance">1.2 Motivation and
+Significance</h3>
+<p>The significance of this project lies in its integration of many core
+system programming concepts into one functioning program. TCP/IP socket
+programming is exercised through the full lifecycle of connection
+management, from creating a listening socket with <code>socket()</code>,
+binding it to an address with <code>bind()</code>, marking it passive
+with <code>listen()</code>, accepting incoming clients with
+<code>accept()</code>, and exchanging data with <code>recv()</code> and
+<code>send()</code>, to finally closing file descriptors with
+<code>close()</code>. POSIX threading is exercised through the creation
+of a fixed pool of worker threads using <code>pthread_create()</code>
+and their orderly termination via <code>pthread_join()</code>.
+Synchronization is exercised through a <code>pthread_mutex_t</code>
+protecting a shared circular buffer and two <code>pthread_cond_t</code>
+condition variables coordinating the producer-consumer relationship
+between the acceptor thread and the workers. Filesystem interaction is
+exercised through <code>stat()</code> for metadata queries,
+<code>realpath()</code> for canonical path resolution,
+<code>opendir()</code> and <code>readdir()</code> for directory
+traversal, and <code>fopen()</code>, <code>fread()</code>,
+<code>fseeko()</code>, and <code>fclose()</code> for buffered file I/O.
+Signal handling is exercised through the registration of handlers for
+<code>SIGINT</code> and <code>SIGTERM</code> that trigger a graceful
+shutdown sequence coordinating all threads. Memory management is
+exercised through careful use of stack-allocated buffers, heap-allocated
+dynamic strings with <code>malloc()</code> and <code>realloc()</code>,
+and <code>memmove()</code> for handling partial reads in the connection
+buffer.</p>
+<p>These are the same building blocks used in production network
+services. By implementing them from scratch without relying on
+high-level frameworks or libraries, the project provides hands-on
+understanding of how operating system interfaces compose to form a
+functioning, concurrent, and secure network application.</p>
+<h3 id="project-scope-and-features">1.3 Project Scope and Features</h3>
+<p>The server supports both HTTP/1.0 and HTTP/1.1 request parsing with
+correct version-specific connection semantics, the GET and HEAD methods
+(with other methods returning 501 Not Implemented), persistent
+connections via Keep-Alive with the correct default behavior for each
+protocol version, static file serving with MIME type detection based on
+file extension, dynamically generated HTML directory listings with
+sorted entries and proper output encoding, single byte-range requests
+with 206 Partial Content and 416 Range Not Satisfiable responses
+conforming to RFC 9110, Common Log Format access logging with
+thread-safe writes and crash-safe flushing, a fixed thread pool with a
+bounded producer-consumer queue that applies backpressure via HTTP 503
+Service Unavailable when the system is overloaded, and graceful shutdown
+via POSIX signal handling with coordinated thread termination. The
+project is validated through a comprehensive test suite comprising unit
+tests, black-box integration tests, and concurrent stress
+benchmarks.</p>
+<h3 id="source-tree-organization">1.4 Source Tree Organization</h3>
+<p>The project follows a modular directory structure designed to enforce
+separation of concerns. The entry point of the program resides in
+<code>src/main.c</code>, which is responsible for parsing command-line
+arguments using POSIX <code>getopt()</code>, registering signal handlers
+for SIGINT and SIGTERM, and invoking the server lifecycle functions. The
+server core in <code>src/server.c</code> handles the creation of the
+listening socket, the accept loop that receives incoming connections,
+the dispatching of client file descriptors to the thread pool queue, and
+the generation of HTTP responses for files, directories, and error
+conditions. The thread pool implementation in
+<code>src/thread_pool.c</code> provides the bounded socket queue as a
+circular buffer with mutex and condition variable synchronization, the
+worker thread lifecycle management, and the graceful shutdown mechanism.
+The HTTP parser in <code>src/http.c</code> implements strict request
+line and header parsing, method and version detection, Keep-Alive logic,
+and Range header extraction. The filesystem module in
+<code>src/files.c</code> provides safe path resolution through a
+five-stage validation pipeline, MIME type mapping from file extensions,
+and HTML directory listing generation with both HTML escaping for
+display text and URL encoding for hyperlinks. The access logging module
+in <code>src/log.c</code> implements thread-safe Common Log Format
+logging with mutex-protected writes and immediate flushing for crash
+safety. Each module exposes a clean public API through a corresponding
+header file in the <code>include/</code> directory, and internal
+implementation details are marked <code>static</code> to enforce
+encapsulation.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Ảnh chụp cấu trúc thư mục dự án (cây thư mục)
+trong terminal hoặc file explorer, hiển thị rõ các folder src/,
+include/, tests/, bench/, www/, report/]</strong></p>
+</blockquote>
+<hr />
+<h2 id="background-and-theoretical-foundations">2. Background and
+Theoretical Foundations</h2>
+<h3 id="the-hypertext-transfer-protocol">2.1 The Hypertext Transfer
+Protocol</h3>
+<p>The Hypertext Transfer Protocol (HTTP) is an application-layer
+protocol that forms the foundation of data communication on the World
+Wide Web. Originally specified as HTTP/1.0 in RFC 1945 by Berners-Lee,
+Fielding, and Frystyk in 1996, and later refined as HTTP/1.1 in RFC 9112
+by Fielding, Nottingham, and Reschke in 2022, the protocol operates on a
+request-response model over reliable TCP connections. An HTTP
+transaction begins when a client establishes a TCP connection to the
+server through the standard three-way handshake (SYN, SYN-ACK, ACK),
+then sends a request message consisting of a request line, a set of
+header fields, and an optional message body. The server processes the
+request and returns a response message consisting of a status line
+indicating success or failure, a set of response headers, and an
+optional response body containing the requested content. After the
+exchange is complete, the connection is either closed or kept alive for
+subsequent requests, depending on the protocol version and the presence
+of connection management headers.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ minh họa TCP three-way handshake (SYN,
+SYN-ACK, ACK) giữa Client và Server, theo sau là HTTP Request/Response
+flow trên cùng kết nối TCP]</strong></p>
+</blockquote>
+<p>The request line of an HTTP message has the fixed format
+<code>Method SP Request-URI SP HTTP-Version CRLF</code>, where SP
+denotes a single space character and CRLF denotes the carriage-return
+line-feed sequence <code>\r\n</code>. For example, a typical request
+line reads <code>GET /index.html HTTP/1.1\r\n</code>. Following the
+request line, each header field occupies one line in the format
+<code>Header-Name: Header-Value\r\n</code>. The header section is
+terminated by an empty line (a bare CRLF), which may be followed by an
+optional message body. This textual, line-oriented format makes HTTP
+relatively straightforward to parse, but the parser must handle edge
+cases carefully — empty fields, missing components, unknown header
+names, oversized inputs, and percent-encoded characters in the URI all
+require explicit validation.</p>
+<p>The two HTTP versions supported by this server differ fundamentally
+in their default connection management behavior. In HTTP/1.0, the
+connection is closed after each response unless the client explicitly
+includes the header <code>Connection: keep-alive</code>, in which case
+the server may choose to keep the connection open for additional
+requests. In HTTP/1.1, the connection is persistent by default; it
+remains open for subsequent requests unless either party sends the
+header <code>Connection: close</code>. This difference has significant
+performance implications: HTTP/1.0’s default close behavior forces a new
+TCP three-way handshake for every request, while HTTP/1.1’s persistent
+connections amortize the handshake cost across many requests on the same
+connection, reducing latency and server load. The server must correctly
+implement these version-specific semantics to interoperate with both
+older HTTP/1.0 clients and modern HTTP/1.1 clients.</p>
+<h3 id="concurrency-models-for-network-servers">2.2 Concurrency Models
+for Network Servers</h3>
+<p>Handling multiple simultaneous clients is a fundamental challenge in
+network server design. The simplest concurrent model, often called
+thread-per-connection, creates a new operating system thread for each
+incoming connection by calling <code>pthread_create()</code> immediately
+after <code>accept()</code>. While easy to implement and reason about,
+this approach has serious scalability drawbacks: the cost of
+<code>pthread_create()</code> is non-trivial (each thread requires its
+own stack, typically 64 KB or more by default), and under heavy load the
+number of threads can grow unbounded, leading to memory exhaustion,
+excessive context switching overhead, and eventual failure of the
+<code>pthread_create()</code> call itself. In production systems, a
+denial-of-service attack could trivially exploit this by opening
+thousands of connections.</p>
+<p>The fixed thread pool model, adopted by this project, addresses these
+drawbacks by creating a predetermined number of worker threads at server
+startup and distributing incoming connections through a shared queue.
+The acceptor thread (typically the main thread) calls
+<code>accept()</code> in a loop and places each accepted client file
+descriptor into a bounded queue. Worker threads block on the queue until
+a file descriptor becomes available, then process the client’s HTTP
+request, send the response, and return to the queue for more work. This
+design provides several important properties: resource usage is bounded
+and predictable (exactly N threads regardless of load), thread creation
+overhead is paid only once at startup, work is naturally distributed
+across workers in FIFO order, and the bounded queue provides a mechanism
+for backpressure when the server is overloaded. The trade-off is
+moderate synchronization complexity — the shared queue requires a mutex
+for mutual exclusion and condition variables for efficient blocking —
+which is a worthwhile investment given the improved robustness and
+predictability.</p>
+<p>A third approach, the event-driven model using system calls such as
+<code>epoll</code> on Linux or <code>kqueue</code> on BSD, can handle
+tens of thousands of concurrent connections with very few threads by
+multiplexing I/O readiness notifications. While more scalable for
+extreme connection counts, event-driven programming is significantly
+more complex, requiring state machines for each connection and careful
+management of non-blocking I/O. This model is not adopted in the current
+project but is discussed as a direction for future optimization in
+Section 11.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Bảng so sánh trực quan giữa 3 mô hình:
+Thread-per-Connection, Fixed Thread Pool, và Event-Driven, có biểu đồ
+minh họa resource usage (memory, CPU) khi tăng số lượng client đồng
+thời]</strong></p>
+</blockquote>
+<h3 id="the-producer-consumer-pattern-and-bounded-buffers">2.3 The
+Producer-Consumer Pattern and Bounded Buffers</h3>
+<p>The producer-consumer pattern is a classical concurrency design
+pattern in which one or more producer threads generate work items and
+place them into a shared buffer, while one or more consumer threads
+remove items from the buffer and process them. The pattern arises
+naturally in many systems: print spoolers (the application is the
+producer, the printer driver is the consumer), web servers (the acceptor
+produces connections, workers consume them), and message queues in
+distributed systems.</p>
+<p>Correct implementation of the producer-consumer pattern requires
+three synchronization guarantees. First, mutual exclusion: only one
+thread may access the shared buffer at any given moment, preventing data
+races that could corrupt the buffer’s internal state (head pointer, tail
+pointer, count). Second, blocking on empty: when a consumer finds the
+buffer empty, it must wait efficiently (sleeping rather than spinning in
+a busy loop) until a producer adds an item. Third, blocking or rejection
+on full: when a producer finds the buffer at capacity, it must either
+wait for space to become available or reject the work item with an
+appropriate signal. In the POSIX threading model, these guarantees are
+achieved through a combination of a <code>pthread_mutex_t</code> for
+mutual exclusion and <code>pthread_cond_t</code> condition variables for
+efficient waiting: a <code>not_empty</code> condition variable signals
+consumers that items are available, and a <code>not_full</code>
+condition variable signals producers that space has been freed. The
+condition variable wait loop must use <code>while</code> rather than
+<code>if</code> to protect against spurious wakeups — a well-documented
+behavior in POSIX where <code>pthread_cond_wait()</code> may return even
+without a corresponding signal.</p>
+<p>In this project, the acceptor thread is the single producer,
+enqueuing accepted client socket file descriptors into the bounded
+queue, and the worker threads are multiple consumers, dequeuing sockets
+and handling the associated HTTP requests. The bounded queue is
+implemented as a circular buffer of integers (file descriptors) with
+modulo-arithmetic index wrapping, providing O(1) enqueue and dequeue
+operations with FIFO ordering.</p>
+<h3 id="path-traversal-attacks-and-defense-in-depth">2.4 Path Traversal
+Attacks and Defense-in-Depth</h3>
+<p>Path traversal, also known as directory traversal, is a well-known
+class of web server vulnerabilities classified as CWE-22 (Improper
+Limitation of a Pathname to a Restricted Directory) by the MITRE Common
+Weakness Enumeration. An attacker exploits this vulnerability by
+crafting a request URI containing <code>..</code> (parent directory)
+segments — or their URL-encoded equivalents <code>%2e%2e</code> — to
+escape the configured document root and access arbitrary files on the
+server’s filesystem. For example, a request for
+<code>GET /../../../../etc/passwd HTTP/1.1</code> could, if the server
+naively concatenates the document root with the request path, cause the
+server to reveal the system’s password file.</p>
+<p>Defense against path traversal requires a defense-in-depth strategy
+with multiple independent mitigation layers, because any single check
+may be bypassed through encoding tricks, symlink manipulation, or edge
+cases in path normalization. This project implements five sequential
+validation stages: URL decoding of percent-encoded characters,
+string-level rejection of <code>..</code> as a path segment,
+concatenation of the decoded path with the document root, canonical
+resolution of both the document root and the target path using
+<code>realpath(3)</code> to eliminate symbolic links and relative
+components, and finally a prefix check verifying that the resolved
+target path begins with the resolved document root path. Each stage can
+independently reject the request, and a failure at any stage prevents
+subsequent stages from executing. This layered approach ensures that
+even if one stage contains a subtle bug, the remaining stages provide
+additional protection.</p>
+<hr />
+<h2 id="system-architecture-and-design">3. System Architecture and
+Design</h2>
+<h3 id="modular-architecture">3.1 Modular Architecture</h3>
+<p>The server is designed as a collection of focused, loosely coupled
+modules, each encapsulating a single area of responsibility. The entry
+point module (<code>src/main.c</code>) handles command-line parsing and
+signal registration; it knows about configuration and the server
+lifecycle but nothing about HTTP or filesystems. The server core module
+(<code>src/server.c</code>) manages the listening socket, the accept
+loop, and request handling; it orchestrates the other modules but
+delegates protocol parsing to the HTTP module, path resolution to the
+filesystem module, and log writing to the logging module. The HTTP
+parser module (<code>src/http.c</code>) is a pure function: it takes a
+byte buffer and produces a structured request object, with no side
+effects and no dependencies on other project modules. The filesystem
+module (<code>src/files.c</code>) handles path validation, MIME type
+detection, and directory listing generation, depending only on POSIX
+filesystem APIs. The thread pool module (<code>src/thread_pool.c</code>)
+provides the bounded queue and worker thread management, depending only
+on the POSIX threading API. The logging module (<code>src/log.c</code>)
+provides thread-safe log writes, depending only on <code>stdio</code>
+and <code>pthread</code>. This design ensures that each module can be
+understood, modified, and tested independently, and that dependencies
+flow in a single direction from higher-level modules to lower-level
+ones.</p>
+<p>Each module exposes its public interface through a header file in the
+<code>include/</code> directory. Internal functions and data structures
+are declared <code>static</code>, making them invisible to other
+translation units and enforcing information hiding at the compiler
+level. This practice reduces the risk of name collisions, makes the
+public API surface explicit, and allows the compiler to optimize
+internal functions more aggressively.</p>
+<h3 id="system-architecture-overview">3.2 System Architecture
+Overview</h3>
+<p>The overall system follows a pipeline architecture in which incoming
+TCP connections flow through several processing stages. An HTTP client
+initiates a TCP connection to the server. The acceptor thread, running
+the main event loop in <code>server_run()</code>, calls
+<code>accept()</code> to obtain a new client socket file descriptor and
+enqueues it into the bounded socket queue. One of the N pre-created
+worker threads dequeues the file descriptor, reads the HTTP request from
+the socket, passes the raw bytes to the HTTP parser, resolves the
+requested path through the filesystem module, generates the appropriate
+response (file content, directory listing, or error message), sends the
+response back to the client, writes a log entry through the logging
+module, and either loops back for the next request on the same
+connection (if Keep-Alive is active) or closes the connection and
+returns to the queue for a new client.</p>
+<pre class="mermaid"><code>flowchart LR
+    Client[&quot;HTTP Client&quot;] --&gt; Listener[&quot;Listening Socket / Accept Loop&quot;]
+    Listener --&gt; Queue[&quot;Bounded Socket Queue&quot;]
+    Queue --&gt; WorkerA[&quot;Worker Thread 1&quot;]
+    Queue --&gt; WorkerB[&quot;Worker Thread 2&quot;]
+    Queue --&gt; WorkerN[&quot;Worker Thread N&quot;]
+    WorkerA --&gt; Parser[&quot;HTTP Parser&quot;]
+    WorkerB --&gt; Parser
+    WorkerN --&gt; Parser
+    Parser --&gt; Files[&quot;Filesystem Resolver&quot;]
+    Files --&gt; DocRoot[&quot;www/ Document Root&quot;]
+    Files --&gt; Listing[&quot;Directory Listing Generator&quot;]
+    Parser --&gt; Logger[&quot;Common Log Format Logger&quot;]
+    Files --&gt; Response[&quot;HTTP Response Writer&quot;]
+    Response --&gt; Client</code></pre>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ kiến trúc hệ thống tổng thể vẽ đẹp bằng
+draw.io hoặc Figma, với các khối module có màu sắc và mũi tên thể hiện
+luồng dữ liệu từ Client → Accept Loop → Queue → Workers →
+Parser/Filesystem/Logger → Response → Client]</strong></p>
+</blockquote>
+<h3 id="request-lifecycle">3.3 Request Lifecycle</h3>
+<p>The complete lifecycle of an HTTP request through the server can be
+described as a sequence of interactions among the architectural
+components. The process begins when an HTTP client establishes a TCP
+connection to the server’s listening socket. The acceptor thread, which
+runs the <code>accept()</code> system call in a loop, returns from
+<code>accept()</code> with a new file descriptor representing the client
+connection. This file descriptor is passed to
+<code>socket_queue_enqueue()</code>, which places it at the tail of the
+bounded circular buffer, signals the <code>not_empty</code> condition
+variable to wake one sleeping worker, and returns immediately to
+continue accepting connections. If the queue is full,
+<code>enqueue()</code> returns <code>QUEUE_FULL</code>, and the acceptor
+responds to the client with HTTP 503 Service Unavailable before closing
+the socket — this is the backpressure mechanism that prevents unbounded
+memory growth under overload.</p>
+<p>On the consumer side, a worker thread that has been blocking on
+<code>socket_queue_dequeue()</code> is awakened by the
+<code>not_empty</code> signal. It acquires the mutex, removes the file
+descriptor from the head of the circular buffer, signals
+<code>not_full</code> in case the producer was waiting for space,
+releases the mutex, and begins processing the client. The worker calls
+<code>recv()</code> to read bytes from the socket into a stack-allocated
+buffer, then passes the buffer to <code>http_parse_request()</code>,
+which extracts the method, URI, HTTP version, Connection header, and
+Range header into an <code>http_request_t</code> structure. Based on the
+parsed request, the worker calls <code>file_stat_path()</code> to
+resolve the URI against the document root and determine whether the
+target is a regular file, a directory, or nonexistent. For regular
+files, the worker opens the file with <code>fopen()</code>, optionally
+seeks to the requested byte range with <code>fseeko()</code>, and
+streams the content to the client in 8 KB chunks. For directories, the
+worker calls <code>file_build_directory_listing()</code> to generate an
+HTML page with sorted, encoded entries. For errors, the worker sends an
+appropriate HTTP error response with the correct status code and reason
+phrase. After the response is fully sent, the worker calls
+<code>access_log_write()</code> to record the request in Common Log
+Format. Finally, based on the Keep-Alive determination from
+<code>http_should_keep_alive()</code>, the worker either loops back to
+<code>recv()</code> for the next request on the same connection or
+closes the socket and returns to the queue.</p>
+<pre class="mermaid"><code>sequenceDiagram
+    participant C as Client
+    participant A as Acceptor Thread
+    participant Q as Bounded Queue
+    participant W as Worker Thread
+    participant H as HTTP Parser
+    participant F as Filesystem
+    participant L as Access Log
+
+    C-&gt;&gt;A: TCP connection (SYN/SYN-ACK/ACK)
+    A-&gt;&gt;Q: enqueue(client_fd)
+    Q-&gt;&gt;W: dequeue(client_fd)
+    C-&gt;&gt;W: HTTP request bytes
+    W-&gt;&gt;H: parse request line + headers
+    H--&gt;&gt;W: method, path, version, keep_alive
+    W-&gt;&gt;F: resolve path under document root
+    F--&gt;&gt;W: file content / directory listing / error
+    W-&gt;&gt;C: HTTP status + headers + body
+    W-&gt;&gt;L: write CLF access log entry
+    alt Keep-Alive enabled
+        C-&gt;&gt;W: next request on same connection
+    else Connection: close
+        W--&gt;&gt;C: close TCP connection
+    end</code></pre>
+<blockquote>
+<p><strong>[Chèn ảnh: Sequence diagram minh họa vòng đời request, có thể
+vẽ lại đẹp hơn bằng draw.io hoặc Lucidchart, dùng các màu khác nhau cho
+từng participant]</strong></p>
+</blockquote>
+<h3 id="configuration-and-startup">3.4 Configuration and Startup</h3>
+<p>The server accepts six command-line options parsed with the POSIX
+<code>getopt()</code> function. The <code>-h</code> option specifies the
+bind address (defaulting to <code>0.0.0.0</code> for all interfaces),
+<code>-p</code> sets the TCP port (defaulting to 8080), <code>-r</code>
+designates the document root directory (defaulting to <code>www</code>),
+<code>-t</code> controls the number of worker threads (defaulting to 4),
+<code>-q</code> sets the bounded queue capacity (defaulting to 64), and
+<code>-l</code> specifies the access log file path (defaulting to
+<code>access.log</code>). All integer parameters are validated through a
+custom <code>parse_positive_int()</code> function that uses
+<code>strtol()</code> with complete error checking — rejecting null
+pointers, empty strings, non-numeric characters, values outside the
+range 1 to 65535, and overflow conditions. The validated configuration
+is stored in a <code>server_config_t</code> structure and passed to
+<code>server_init()</code>, which creates the listening socket,
+initializes the bounded queue, opens the access log file, and starts the
+thread pool. After initialization, the main function registers signal
+handlers for <code>SIGINT</code> and <code>SIGTERM</code>, then calls
+<code>server_run()</code>, which enters the accept loop and does not
+return until a shutdown signal is received.</p>
+<h3 id="build-system">3.5 Build System</h3>
+<p>The project uses GNU Make as its build system, with a Makefile that
+defines targets for building, testing, and benchmarking. The compilation
+command uses strict compiler flags to enforce code quality:
+<code>-std=c11</code> enforces the C11 language standard,
+<code>-Wall -Wextra</code> enable comprehensive warnings,
+<code>-Werror</code> treats all warnings as compilation errors, and
+<code>-pedantic</code> enforces strict ISO C compliance. The POSIX
+feature test macros <code>-D_POSIX_C_SOURCE=200809L</code> and
+<code>-D_XOPEN_SOURCE=700</code> enable the full POSIX.1-2008 API
+surface, including functions such as <code>getaddrinfo()</code>,
+<code>realpath()</code>, <code>localtime_r()</code>,
+<code>fseeko()</code>, and <code>strndup()</code>. The threading library
+is linked via <code>-pthread</code>. The Makefile defines separate
+targets for unit testing (<code>make test-unit</code>), integration
+testing (<code>make test-integration</code>), combined testing
+(<code>make test</code>), and benchmarking (<code>make bench</code>),
+allowing each validation step to be run independently during
+development.</p>
+<hr />
+<h2 id="http-protocol-implementation">4. HTTP Protocol
+Implementation</h2>
+<h3 id="design-philosophy">4.1 Design Philosophy</h3>
+<p>The HTTP protocol implementation, residing entirely in
+<code>src/http.c</code>, provides three public functions:
+<code>http_parse_request()</code> for parsing a raw byte buffer into a
+structured request, <code>http_should_keep_alive()</code> for
+determining whether the connection should remain open after the
+response, and <code>http_status_text()</code> for mapping numeric status
+codes to their textual reason phrases. A deliberate design decision was
+made to perform all parsing without dynamic memory allocation. Every
+parsed field is stored in a fixed-size buffer within the
+<code>http_request_t</code> structure — the method text occupies at most
+16 bytes, the path at most 1024 bytes, the version text at most 16
+bytes, and the Connection header value at most 32 bytes. This approach
+eliminates the possibility of <code>malloc()</code> failures during
+request processing, simplifies error handling (no cleanup paths for
+partially allocated state), and keeps all per-request memory on the
+stack or in caller-provided structures.</p>
+<h3 id="request-line-parsing">4.2 Request Line Parsing</h3>
+<p>The parsing of an HTTP request line is performed by
+<code>http_parse_request()</code> through a sequence of strict
+validation steps. The function first scans the input buffer for a CRLF
+sequence (<code>\r\n</code>) using the internal <code>find_crlf()</code>
+helper, which performs a linear scan through the buffer looking for the
+two-byte pattern. If no CRLF is found within the buffer bounds, the
+request is immediately rejected as malformed with a return code of
+<code>HTTP_PARSE_BAD_REQUEST</code>. Once the CRLF is located, the
+function uses <code>memchr()</code> to find the first and second space
+characters within the request line, which separate the three components:
+method, request-URI, and HTTP version. If either space is missing, or if
+the method or version string would be empty (zero-length), the request
+is rejected.</p>
+<p>The method component is parsed by <code>parse_method()</code>, which
+performs exact string comparison against <code>"GET"</code> and
+<code>"HEAD"</code>. If the method matches <code>GET</code>, the
+function returns <code>HTTP_METHOD_GET</code>; if it matches
+<code>HEAD</code>, it returns <code>HTTP_METHOD_HEAD</code>; any other
+method string — including <code>POST</code>, <code>PUT</code>,
+<code>DELETE</code>, <code>OPTIONS</code>, <code>PATCH</code>, and any
+custom method — results in <code>HTTP_METHOD_UNSUPPORTED</code>. This
+design ensures that the parser accepts all syntactically valid request
+lines without assuming a fixed set of methods, while clearly marking
+unsupported methods for the response handler to generate 501 Not
+Implemented.</p>
+<p>The URI component is further processed to strip any query string. If
+the URI contains a <code>?</code> character, only the portion before the
+question mark is retained as the request path; the query string is
+discarded entirely. This simplification is appropriate because the
+server serves static files and directories, and query parameters have no
+effect on the served content. The version component is parsed by
+<code>parse_version()</code>, which matches the exact strings
+<code>"HTTP/1.0"</code> and <code>"HTTP/1.1"</code>. Any other version
+string, including <code>"HTTP/0.9"</code>, <code>"HTTP/2"</code>, or
+malformed strings like <code>"HTTP 1.1"</code>, results in
+<code>HTTP_VERSION_UNKNOWN</code>, which causes the overall parse to
+fail with <code>HTTP_PARSE_BAD_REQUEST</code>.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ minh họa quá trình parsing request line,
+chia HTTP request “GET /index.html HTTP/1.1” thành 3 phần (Method, URI,
+Version) bằng cách tìm space characters, có mũi tên và nhãn rõ
+ràng]</strong></p>
+</blockquote>
+<h3 id="header-parsing-and-connection-semantics">4.3 Header Parsing and
+Connection Semantics</h3>
+<p>After the request line is successfully parsed, the
+<code>parse_headers()</code> function iterates through the remaining
+lines in the buffer, processing each header field until it encounters an
+empty line (which signals the end of the header section and the
+beginning of any message body). For each header line, the function
+locates the colon separator using <code>memchr()</code>, extracts the
+header name and value, trims leading and trailing whitespace from the
+value, and performs case-insensitive comparison of the header name
+against the two recognized header names: <code>Connection</code> and
+<code>Range</code>. The case-insensitive comparison is implemented by
+the <code>ascii_case_equal_bounded()</code> helper, which converts each
+character to lowercase using <code>tolower()</code> before comparison,
+conforming to RFC 9110 §5.1 which states that header field names are
+case-insensitive. Unrecognized headers are silently ignored, which is
+both correct per the HTTP specification and practical for a server that
+does not need to process headers such as <code>Host</code>,
+<code>User-Agent</code>, or <code>Accept-Encoding</code>.</p>
+<p>The <code>Connection</code> header determines the Keep-Alive behavior
+of the connection, and its interpretation depends on the HTTP version.
+For HTTP/1.1, the connection is kept alive by default; it is closed only
+if the <code>Connection</code> header has the value <code>close</code>
+(case-insensitive). For HTTP/1.0, the connection is closed by default;
+it is kept alive only if the <code>Connection</code> header has the
+value <code>keep-alive</code> (case-insensitive). This logic is encoded
+concisely at the end of <code>http_parse_request()</code>: for HTTP/1.1,
+<code>keep_alive_requested</code> is set to the negation of
+<code>ascii_case_equal(connection, "close")</code>; for HTTP/1.0, it is
+set to <code>ascii_case_equal(connection, "keep-alive")</code>. The
+server echoes the appropriate <code>Connection</code> header value in
+every response, including <code>Connection: keep-alive</code> for
+persistent connections and <code>Connection: close</code> for
+connections that will be terminated, so that both parties agree on the
+connection state.</p>
+<h3 id="safe-string-handling">4.4 Safe String Handling</h3>
+<p>The HTTP parser is a security-critical component because it processes
+untrusted input received directly from the network. To prevent buffer
+overflow vulnerabilities, all string copy operations use the bounded
+<code>copy_bounded()</code> function, which takes an explicit
+destination size parameter and truncates the source if it exceeds the
+available space, always ensuring null termination. Memory searches use
+<code>memchr()</code> with explicit length bounds rather than
+<code>strchr()</code> on potentially unterminated strings. Formatted
+output uses <code>snprintf()</code> exclusively, never
+<code>sprintf()</code>. The Range header parser includes integer
+overflow protection in its <code>parse_size_token()</code> function,
+which checks before each multiplication that the result will not exceed
+<code>SIZE_MAX</code>. These practices collectively ensure that no
+input, regardless of its content or length, can cause the parser to
+write beyond allocated buffer boundaries.</p>
+<h3 id="supported-http-status-codes">4.5 Supported HTTP Status
+Codes</h3>
+<p>The server generates nine distinct HTTP status codes corresponding to
+different request outcomes. A 200 OK response indicates a successful
+file or directory response. A 206 Partial Content response indicates
+that a valid byte-range request was served. A 400 Bad Request response
+indicates that the request line or headers were malformed and could not
+be parsed. A 403 Forbidden response indicates that a path traversal
+attempt was blocked by the filesystem security layer. A 404 Not Found
+response indicates that the requested file or directory does not exist
+on disk. A 416 Range Not Satisfiable response indicates that the
+requested byte range could not be served because the start position
+exceeds the file size. A 500 Internal Server Error response indicates a
+system-level failure such as a file read error. A 501 Not Implemented
+response indicates that the request used an HTTP method other than GET
+or HEAD. A 503 Service Unavailable response indicates that the bounded
+queue is full and the server cannot accept additional clients at this
+time.</p>
+<hr />
+<h2 id="thread-pool-and-concurrency-architecture">5. Thread Pool and
+Concurrency Architecture</h2>
+<h3 id="design-rationale">5.1 Design Rationale</h3>
+<p>As discussed in Section 2.2, the project adopts a fixed thread pool
+model to achieve bounded resource usage, predictable performance under
+load, and clear demonstration of producer-consumer synchronization. The
+thread pool architecture consists of three interacting components: a
+bounded socket queue implemented as a circular buffer, a set of
+pre-created worker threads that dequeue and process connections, and the
+acceptor thread that accepts connections and enqueues file descriptors.
+The queue capacity and thread count are both configurable at startup,
+allowing operators to tune the server for different hardware
+capabilities and expected workloads.</p>
+<h3 id="bounded-queue-implementation">5.2 Bounded Queue
+Implementation</h3>
+<p>The bounded socket queue is the central synchronization structure of
+the server. It is implemented as a <code>socket_queue_t</code> structure
+containing a dynamically allocated integer array serving as the circular
+buffer, <code>head</code> and <code>tail</code> indices for tracking the
+dequeue and enqueue positions, a <code>count</code> field tracking the
+number of items currently in the queue, a <code>capacity</code> field
+recording the maximum queue size, a <code>pthread_mutex_t</code>
+protecting all shared state, a <code>pthread_cond_t not_empty</code>
+condition variable for signaling consumers that items are available, a
+<code>pthread_cond_t not_full</code> condition variable for signaling
+producers that space has been freed, and a <code>shutdown</code> flag
+used to coordinate graceful termination.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ minh họa Circular Buffer (Bounded Queue) với
+head, tail, count, capacity. Vẽ dạng vòng tròn hoặc mảng tuyến tính với
+wrap-around arrows, thể hiện ba trạng thái: empty (head == tail, count
+== 0), partially full, và full (count == capacity)]</strong></p>
+</blockquote>
+<p>The circular buffer uses modulo arithmetic for index wrapping,
+ensuring O(1) time complexity for both enqueue and dequeue operations
+regardless of the queue size. When an item is enqueued, it is placed at
+<code>items[tail]</code> and the tail index advances to
+<code>(tail + 1) % capacity</code>. When an item is dequeued, it is read
+from <code>items[head]</code> and the head index advances to
+<code>(head + 1) % capacity</code>. The <code>count</code> field is
+incremented on enqueue and decremented on dequeue, providing an O(1)
+check for empty and full conditions without the ambiguity inherent in
+head/tail comparison alone.</p>
+<p>The enqueue operation, implemented in
+<code>socket_queue_enqueue()</code>, follows a non-blocking strategy.
+The function acquires the mutex, checks whether the queue is shut down
+(returning <code>QUEUE_CLOSED</code>), checks whether the queue is at
+capacity (returning <code>QUEUE_FULL</code>), and if space is available,
+places the file descriptor at the tail position, advances the tail,
+increments the count, signals <code>not_empty</code> to wake one waiting
+worker, and releases the mutex. The non-blocking design is critical: if
+the enqueue blocked when the queue was full, the acceptor thread would
+stall, preventing it from calling <code>accept()</code> to drain the
+kernel’s TCP backlog, which could cause connection timeouts for other
+clients. Instead, the acceptor responds immediately with HTTP 503
+Service Unavailable and closes the connection, informing the client that
+the server is temporarily overloaded while allowing the acceptor to
+continue processing other connections.</p>
+<p>The dequeue operation, implemented in
+<code>socket_queue_dequeue()</code>, follows a blocking strategy. The
+function acquires the mutex, then enters a <code>while</code> loop that
+checks whether the queue is empty and not shut down; if both conditions
+are true, the function calls
+<code>pthread_cond_wait(&amp;not_empty, &amp;mutex)</code>, which
+atomically releases the mutex and puts the calling thread to sleep until
+another thread signals the condition variable. When the thread is
+awakened, the mutex is re-acquired and the <code>while</code> condition
+is re-checked — this is the correct pattern for handling spurious
+wakeups, which are a documented behavior in POSIX where
+<code>pthread_cond_wait()</code> may return even without a corresponding
+signal. If the queue is empty and the shutdown flag is set, the function
+returns <code>QUEUE_CLOSED</code>, causing the worker to exit its main
+loop. Otherwise, the function reads the file descriptor from the head
+position, advances the head, decrements the count, signals
+<code>not_full</code> to notify the producer that space is available,
+releases the mutex, and returns the file descriptor.</p>
+<h3 id="backpressure-mechanism">5.3 Backpressure Mechanism</h3>
+<p>When the acceptor thread receives <code>QUEUE_FULL</code> from the
+enqueue operation, it applies backpressure by immediately sending an
+HTTP 503 Service Unavailable response to the client with
+<code>Connection: close</code>, logging the event in the access log with
+a dash placeholder for the request line, and closing the client socket.
+This mechanism prevents unbounded memory growth under load, informs the
+client using the semantically correct HTTP status code for temporary
+overload, preserves fairness by continuing to process already-queued
+connections rather than blocking the acceptor, and keeps the acceptor
+non-blocking so it can continue draining the kernel’s TCP backlog. The
+queue capacity is configurable at startup via the <code>-q</code>
+command-line option, allowing operators to balance between memory usage
+(larger queues use more memory) and overload tolerance (larger queues
+accept more burst traffic before triggering backpressure).</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ minh họa Backpressure mechanism — khi queue
+đầy, acceptor trả về 503 Service Unavailable cho client mới và đóng kết
+nối, trong khi workers tiếp tục xử lý các request đã được
+enqueue]</strong></p>
+</blockquote>
+<h3 id="worker-thread-lifecycle">5.4 Worker Thread Lifecycle</h3>
+<p>Worker threads are created during server initialization by
+<code>thread_pool_start()</code>, which allocates a
+<code>worker_args_t</code> structure on the heap for each thread
+(containing a pointer to the shared pool), creates the thread with
+<code>pthread_create()</code>, and records the thread ID in a
+dynamically allocated array. If any thread creation fails, the function
+sets the pool’s thread count to the number of threads successfully
+created and calls <code>thread_pool_stop()</code> to shut down and join
+the already-created threads, then returns an error code to the caller.
+This error handling ensures that no threads are leaked even during
+partial initialization failure.</p>
+<p>Each worker thread’s entry point is the <code>worker_main()</code>
+function, which first frees the heap-allocated
+<code>worker_args_t</code> structure (transferring ownership from the
+creator to the thread), then enters a simple loop: call
+<code>socket_queue_dequeue()</code> to obtain a client file descriptor,
+call the registered handler function (which processes the HTTP request),
+and repeat. When <code>dequeue()</code> returns
+<code>QUEUE_CLOSED</code> due to shutdown, the loop exits and the thread
+function returns <code>NULL</code>, allowing <code>pthread_join()</code>
+to reap the thread.</p>
+<h3 id="graceful-shutdown">5.5 Graceful Shutdown</h3>
+<p>The graceful shutdown sequence is designed to ensure that all
+resources are properly released and no threads are left in an
+indeterminate state. When a SIGINT or SIGTERM signal is received, the
+signal handler sets <code>server-&gt;should_stop = 1</code> using a
+<code>volatile sig_atomic_t</code> field, which guarantees atomic reads
+and writes without requiring a mutex in the signal handler context. The
+signal handler then calls <code>server_stop()</code>, which closes the
+listening socket file descriptor. This causes the blocking
+<code>accept()</code> call in the acceptor loop to return with an error
+(<code>EBADF</code> or <code>EINTR</code>). The acceptor loop checks
+<code>should_stop</code>, finds it set, and exits.</p>
+<p>Next, <code>socket_queue_shutdown()</code> is called, which acquires
+the mutex, sets the <code>shutdown</code> flag, calls
+<code>pthread_cond_broadcast()</code> on both the <code>not_empty</code>
+and <code>not_full</code> condition variables to wake all sleeping
+threads, and releases the mutex. The use of <code>broadcast</code>
+rather than <code>signal</code> is critical during shutdown because all
+waiting workers must be woken, not just one — each worker needs to see
+the shutdown flag and exit its loop. After the broadcast,
+<code>thread_pool_stop()</code> calls <code>pthread_join()</code> on
+each worker thread, blocking until every thread has exited. Only after
+all threads have been joined does the function free the thread array and
+return, at which point the caller can safely destroy the queue, close
+the access log, and free remaining resources.</p>
+<h3 id="synchronization-correctness">5.6 Synchronization
+Correctness</h3>
+<p>The thread pool’s synchronization design avoids deadlock because the
+system has only one mutex (the queue mutex) and no circular wait
+dependencies: the acceptor thread acquires the mutex briefly during
+enqueue and never waits for workers, while workers acquire the mutex
+during dequeue and never wait for the acceptor except through the
+condition variable, which atomically releases the mutex before sleeping.
+Livelock is avoided because every enqueue signals exactly one consumer
+and every dequeue signals the producer, ensuring that progress is made
+whenever items are in the queue. The <code>while</code> loop around
+<code>pthread_cond_wait()</code> prevents spurious wakeups from
+corrupting queue state, and the shutdown broadcast ensures that all
+threads eventually exit regardless of the order in which signals are
+delivered.</p>
+<hr />
+<h2 id="file-system-layer-and-security">6. File System Layer and
+Security</h2>
+<h3 id="overview-and-threat-model">6.1 Overview and Threat Model</h3>
+<p>The filesystem layer, implemented in <code>src/files.c</code>, serves
+as the security boundary between untrusted HTTP request URIs and the
+server’s on-disk resources. Its primary responsibility is to take a
+client-supplied path string (e.g., <code>/images/logo.png</code>) and
+either resolve it to a verified absolute path within the document root
+directory or reject it with an appropriate error. This component must be
+implemented with extreme care because path-handling bugs in file servers
+are among the most common and dangerous web server vulnerabilities,
+potentially allowing attackers to read arbitrary files from the server’s
+filesystem, including password files, configuration files, and
+application source code. The threat model assumes that the client is
+fully adversarial: every character in the request URI is considered
+untrusted input, and the filesystem module must produce correct results
+for all possible inputs, including paths containing <code>..</code>
+segments, URL-encoded special characters, symbolic links, excessively
+long paths, null bytes, and combinations thereof.</p>
+<h3 id="the-five-stage-path-resolution-pipeline">6.2 The Five-Stage Path
+Resolution Pipeline</h3>
+<p>Every incoming request path passes through five sequential validation
+stages before the server accesses any file on disk. Each stage is
+capable of independently rejecting the request, and a rejection at any
+stage prevents subsequent stages from executing. This defense-in-depth
+approach ensures that even if one validation stage contains a subtle
+bug, the remaining stages provide additional protection.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ flowchart thể hiện 5 giai đoạn của Path
+Resolution Pipeline: (1) URL Decoding → (2) Dot-Dot Rejection → (3) Path
+Joining → (4) realpath() Resolution → (5) Chroot Verification. Mỗi bước
+có nhánh “reject → 403/404” và nhánh “continue → next
+stage”]</strong></p>
+</blockquote>
+<p><strong>Stage 1: URL Decoding.</strong> HTTP URIs use
+percent-encoding to represent special characters: a percent sign
+followed by two hexadecimal digits (e.g., <code>%20</code> for a space
+character, <code>%2F</code> for a forward slash, <code>%2e</code> for a
+period). The <code>decode_path()</code> function iterates through the
+input string and converts each <code>%XY</code> sequence to the
+corresponding byte value. The decoder is intentionally strict: if the
+two characters following a percent sign are not valid hexadecimal
+digits, the function rejects the path entirely by writing a null
+terminator and returning. Backslash characters are also rejected, as
+they have no valid use in Unix paths and their presence may indicate an
+attacker probing for Windows-style path separators. This strictness
+eliminates ambiguous interpretations of malformed encodings that could
+be exploited to bypass later validation stages.</p>
+<p><strong>Stage 2: Dot-Dot Segment Rejection.</strong> After decoding,
+the path is scanned for <code>..</code> as a complete path segment. The
+<code>contains_dot_dot_segment()</code> function normalizes the path by
+stripping the leading slash, then iterates through the string checking
+for the pattern where two consecutive period characters are followed by
+either a forward slash or the null terminator. This check catches both
+embedded traversal segments (e.g., <code>/../etc/passwd</code>) and
+trailing traversal segments (e.g., <code>/path/..</code>). Critically,
+this string-level check runs before <code>realpath(3)</code> because
+<code>realpath()</code> on some operating systems may resolve
+<code>..</code> through symbolic links in unexpected ways, potentially
+producing a canonical path outside the document root even though the
+original input contained <code>..</code>. By rejecting <code>..</code>
+at the string level before any filesystem interaction occurs, the server
+blocks the most common traversal vectors as an early defense.</p>
+<p><strong>Stage 3: Path Joining.</strong> The decoded and validated
+path is joined with the configured document root using
+<code>snprintf()</code>, which guarantees null termination and prevents
+buffer overflow regardless of the input lengths. The leading slash is
+stripped from the request path before joining, so a request for
+<code>/index.html</code> with a document root of <code>/var/www</code>
+produces the candidate path <code>/var/www/index.html</code>.</p>
+<p><strong>Stage 4: Canonical Path Resolution.</strong> Both the
+document root and the candidate target path are resolved to their
+canonical absolute forms using <code>realpath(3)</code>. This POSIX
+function performs three critical operations: it resolves all symbolic
+links to their ultimate targets, removes all <code>.</code> (current
+directory) references, and resolves all <code>..</code> (parent
+directory) references by walking up the directory hierarchy. The result
+is an absolute path with no relative components and no symbolic links.
+If the target path does not exist on disk (or any component of the path
+is a broken symbolic link), <code>realpath()</code> returns
+<code>NULL</code> and the server returns 404 Not Found. By resolving
+both the document root and the target path independently, the server can
+compare two canonical paths without worrying about different
+representations of the same filesystem location.</p>
+<p><strong>Stage 5: Chroot Verification.</strong> The final and most
+critical security check verifies that the resolved canonical target path
+is within the resolved canonical document root. The function calls
+<code>strncmp()</code> to check that the target path begins with the
+document root path as a prefix. However, a simple prefix check is
+insufficient: if the document root is <code>/var/www</code>, the path
+<code>/var/www-extra/secret.txt</code> would pass a naive prefix check
+because it begins with the string <code>/var/www</code>. To prevent
+this, the function additionally checks that the character in the target
+path immediately after the document root prefix is either a forward
+slash (indicating a subdirectory) or a null terminator (indicating the
+path is exactly the document root). If either check fails, the function
+returns <code>FILE_RESULT_FORBIDDEN</code>, which triggers a 403
+Forbidden response.</p>
+<h3 id="mime-type-detection">6.3 MIME Type Detection</h3>
+<p>Once a file’s existence and accessibility are confirmed, the server
+must determine the correct Content-Type header value for the HTTP
+response. The <code>file_mime_type()</code> function implements this by
+extracting the file extension using <code>strrchr()</code> (which finds
+the last period in the filename, correctly handling names like
+<code>file.tar.gz</code> where the extension is <code>.gz</code>), then
+performing case-insensitive comparison against a table of known
+extensions using <code>strcasecmp()</code>. The function recognizes
+<code>.html</code> and <code>.htm</code> as <code>text/html</code>,
+<code>.txt</code> as <code>text/plain</code>, <code>.css</code> as
+<code>text/css</code>, <code>.js</code> as
+<code>application/javascript</code>, <code>.json</code> as
+<code>application/json</code>, <code>.png</code> as
+<code>image/png</code>, <code>.jpg</code> and <code>.jpeg</code> as
+<code>image/jpeg</code>, <code>.gif</code> as <code>image/gif</code>,
+and <code>.svg</code> as <code>image/svg+xml</code>. Any file with an
+unrecognized or missing extension is assigned the MIME type
+<code>application/octet-stream</code>, which instructs the client to
+treat the response as a binary download rather than attempting to render
+it.</p>
+<h3 id="directory-listing-generation">6.4 Directory Listing
+Generation</h3>
+<p>When the resolved path corresponds to a directory rather than a
+regular file, the server dynamically generates an HTML page listing the
+directory’s contents. This process involves reading directory entries
+using <code>opendir(3)</code> and <code>readdir(3)</code>, classifying
+each entry as a file or directory using <code>stat(2)</code> (rather
+than relying on the <code>d_type</code> field of
+<code>struct dirent</code>, which may be <code>DT_UNKNOWN</code> on some
+filesystems such as NFS or certain network-mounted volumes), sorting the
+entries using <code>qsort()</code> with a custom comparator that places
+directories before files and orders entries alphabetically within each
+group, and building the HTML response string.</p>
+<p>The HTML construction requires two distinct encoding operations
+applied to each filename. For the visible display text of each entry,
+HTML escaping is applied: the characters <code>&lt;</code>,
+<code>&gt;</code>, <code>&amp;</code>, and <code>"</code> are replaced
+with their HTML entity equivalents (<code>&amp;lt;</code>,
+<code>&amp;gt;</code>, <code>&amp;amp;</code>, <code>&amp;quot;</code>)
+to prevent Cross-Site Scripting (XSS) attacks. A filename such as
+<code>&lt;script&gt;alert(1)&lt;/script&gt;</code> is rendered as
+literal text in the browser rather than being interpreted as executable
+JavaScript. For the <code>href</code> attribute of each hyperlink, URL
+encoding is applied: characters that are not safe in URLs (spaces,
+punctuation, non-ASCII characters) are replaced with their
+percent-encoded equivalents (e.g., a space becomes <code>%20</code>, a
+hash becomes <code>%23</code>). These two encoding operations serve
+different purposes — HTML escaping protects the rendering context, while
+URL encoding protects the URL context — and both are necessary because a
+filename may contain characters that are problematic in either
+context.</p>
+<p>The HTML response body is assembled using a dynamic string builder
+(<code>string_builder_t</code>) that maintains a heap-allocated buffer
+with a length and capacity, and doubles the capacity on reallocation.
+This approach provides amortized O(1) append operations, avoiding the
+O(n²) performance that would result from repeatedly calling
+<code>realloc()</code> with exactly the needed size. The final HTML
+includes a title element showing the requested path, the complete list
+of directory entries as clickable hyperlinks (with trailing slashes
+appended to directory names), and a parent-directory link when the
+current directory is not the document root.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Ảnh chụp màn hình trình duyệt hiển thị một
+directory listing HTML được server tạo ra, với danh sách file/folder có
+link, icon phân biệt file/folder, và breadcrumb path ở
+trên]</strong></p>
+</blockquote>
+<h3 id="security-summary">6.5 Security Summary</h3>
+<p>The filesystem layer implements a comprehensive, multi-layered
+defense against web server vulnerabilities. Path traversal via
+<code>..</code> segments is blocked at the string level before any
+filesystem interaction and again at the canonical path level after
+<code>realpath()</code> resolution. Symbolic link escape is prevented by
+<code>realpath()</code> resolution combined with chroot-style prefix
+verification. Invalid URL encoding is rejected at the first stage of the
+pipeline through strict hexadecimal digit validation. Backslash
+characters are explicitly rejected as a defensive measure against
+cross-platform path manipulation. Cross-Site Scripting in directory
+listings is prevented by HTML-escaping all displayed filenames. Broken
+URLs in directory listing links are prevented by URL-encoding all
+<code>href</code> attribute values. The combination of these mitigations
+ensures that the filesystem layer is resilient against the attack
+vectors catalogued in CWE-22, CWE-59, CWE-79, and CWE-116.</p>
+<hr />
+<h2 id="access-logging-subsystem">7. Access Logging Subsystem</h2>
+<h3 id="common-log-format-specification">7.1 Common Log Format
+Specification</h3>
+<p>The access logging module, implemented in <code>src/log.c</code>,
+writes one log entry per completed HTTP request in the Common Log Format
+(CLF), a standard that originated with the NCSA httpd server in the
+early 1990s and was subsequently adopted by virtually every major HTTP
+server including Apache, Nginx, and IIS. Each log line follows the
+format
+<code>host ident authuser [timestamp] "request" status bytes</code>,
+where <code>host</code> is the client’s IP address obtained from the TCP
+connection, <code>ident</code> and <code>authuser</code> are placeholder
+fields (set to dashes <code>-</code> because this server does not
+implement the ident protocol or HTTP authentication),
+<code>timestamp</code> is the local date and time in the format
+<code>dd/Mon/yyyy:HH:mm:ss +zzzz</code>, <code>request</code> is the
+complete HTTP request line as received from the client,
+<code>status</code> is the numeric HTTP response status code, and
+<code>bytes</code> is the number of bytes in the response body
+(excluding headers).</p>
+<p>A typical log entry reads:
+<code>127.0.0.1 - - [10/Oct/2026:13:55:36 +0000] "GET /index.html HTTP/1.1" 200 232</code>.
+This format is chosen because it is universally understood by log
+analysis tools such as AWStats, GoAccess, and Webalizer, and because its
+simplicity makes it straightforward to implement without introducing
+complex formatting dependencies.</p>
+<h3 id="thread-safety-architecture">7.2 Thread-Safety Architecture</h3>
+<p>Because the server uses a thread pool in which multiple worker
+threads process requests concurrently, the logging function must be
+thread-safe. Without synchronization, simultaneous
+<code>fprintf()</code> calls from different threads would produce
+garbled, interleaved output — a classic data race on the FILE stream’s
+internal buffer. The implementation addresses this through a
+<code>pthread_mutex_t</code> embedded in the <code>access_log_t</code>
+structure alongside the <code>FILE*</code> pointer. The
+<code>access_log_write()</code> function performs timestamp formatting
+outside the mutex (since <code>localtime_r()</code> and
+<code>strftime()</code> write to thread-local stack buffers and are
+therefore safe to call concurrently), then acquires the mutex, calls
+<code>fprintf()</code> to write the formatted log line, calls
+<code>fflush()</code> to force the buffered data to the kernel, and
+releases the mutex.</p>
+<p>The use of <code>localtime_r()</code> rather than
+<code>localtime()</code> is a deliberate thread-safety measure. The
+standard <code>localtime()</code> function returns a pointer to a static
+<code>struct tm</code> shared across all threads, creating a data race
+when multiple threads call it concurrently. The reentrant variant
+<code>localtime_r()</code> writes its result into a caller-supplied
+buffer on the stack, eliminating the shared state.</p>
+<p>The <code>fflush()</code> call inside the mutex is critical for crash
+safety. Standard C output is buffered: the default buffering mode for
+<code>fopen()</code> with append mode is fully buffered, meaning
+<code>fprintf()</code> may only copy the formatted string into a
+user-space buffer and return immediately without performing any I/O. If
+the server process crashes or is killed before the buffer is flushed,
+the last few log entries would be silently lost. By calling
+<code>fflush()</code> inside the critical section, every successful
+<code>access_log_write()</code> call guarantees that the log line has
+been delivered to the operating system kernel’s write buffer before the
+mutex is released. This makes the logging effectively synchronous: a
+completed log write is durable against process crashes (though not
+necessarily against operating system crashes, which would require
+<code>fsync()</code>).</p>
+<p>The trade-off of this design is performance. Each
+<code>fflush()</code> involves at least one system call (typically
+<code>write(2)</code>), which has non-trivial overhead. Under very high
+request rates, the combination of the mutex and the fflush could become
+a throughput bottleneck. An alternative design would use line-buffered
+mode (configured via
+<code>setvbuf(log-&gt;file, NULL, _IOLBF, 0)</code>), which
+automatically flushes at each newline character, providing slightly
+lower crash-safety guarantees but better performance. Another
+alternative would be per-worker log buffers that are periodically
+flushed to a central file, eliminating mutex contention at the cost of
+additional complexity. These alternatives are discussed as potential
+optimizations in Section 11.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Ảnh chụp nội dung file access.log sau khi chạy
+server và gửi nhiều loại request khác nhau (GET, HEAD, 404, 403), thể
+hiện nhiều dòng log theo CLF format với các status code khác
+nhau]</strong></p>
+</blockquote>
+<h3 id="integration-with-request-handling">7.3 Integration with Request
+Handling</h3>
+<p>The logging call is placed after the response is fully sent to the
+client, which ensures that the logged status code and byte count reflect
+the actual outcome of the request rather than the intended outcome. If a
+file read fails midway through transmission, the logged entry records
+the error status rather than a premature 200. For error responses (400,
+403, 404, 500, 501, 503), the byte count is zero because no meaningful
+content body is sent. For malformed requests that cannot be parsed at
+all, the request line in the log entry is replaced with
+<code>&lt;invalid request&gt;</code> or a dash, preserving the CLF
+structure while indicating that the original request was unparsable.</p>
+<hr />
+<h2 id="http-range-request-support">8. HTTP Range Request Support</h2>
+<h3 id="motivation-and-protocol-background">8.1 Motivation and Protocol
+Background</h3>
+<p>HTTP Range requests, specified in RFC 9110 Section 14.1, allow a
+client to request only a portion of a file’s content rather than the
+entire file. This capability is essential for several practical use
+cases: resumable downloads (if a large download is interrupted, the
+client can request only the remaining bytes rather than restarting from
+the beginning), media streaming (video and audio players seek to
+arbitrary positions within a file by requesting specific byte ranges),
+and bandwidth optimization (a client that already has part of a file
+needs only the missing portion). The <code>Range</code> header uses the
+format <code>Range: bytes=start-end</code>, where byte positions are
+zero-indexed and inclusive on both ends. The server responds with HTTP
+206 Partial Content when the range is satisfiable, or HTTP 416 Range Not
+Satisfiable when the requested range cannot be served.</p>
+<h3 id="range-header-parsing">8.2 Range Header Parsing</h3>
+<p>The Range header is parsed by the <code>parse_range_header()</code>
+function in <code>src/http.c</code>, which is called from the header
+iteration loop when a header with the name <code>Range</code> is
+encountered. The function first validates that the header value begins
+with the prefix <code>bytes=</code>, as the server supports only the
+<code>bytes</code> range unit (the only unit registered with IANA for
+HTTP). If the prefix is missing, the Range header is silently ignored
+and the server serves the full file. Next, the function checks for the
+presence of a comma in the range specification, which would indicate a
+multi-range request (e.g., <code>bytes=0-10, 20-30</code>). Multi-range
+requests are intentionally not supported because they require generating
+a <code>multipart/byteranges</code> response body with MIME boundary
+delimiters, which adds significant complexity for a feature that is
+rarely used in practice. If a comma is found, the Range header is
+ignored and the full file is served.</p>
+<p>The function then distinguishes between two range forms. In the
+explicit range form (<code>bytes=start-end</code>), both the start and
+end byte positions are provided as decimal integers, and the server will
+serve bytes from <code>start</code> to <code>end</code> inclusive. In
+the suffix range form (<code>bytes=-N</code>), only the suffix length is
+provided, and the server will serve the last N bytes of the file. The
+distinction is made by checking whether the dash character is the first
+character of the range specification: if it is, the form is a suffix
+range; otherwise, it is an explicit range. Integer values are parsed by
+the <code>parse_size_token()</code> helper, which includes overflow
+protection: before each multiplication by 10, it checks that the
+intermediate result will not exceed <code>SIZE_MAX</code>, preventing
+integer overflow for extremely large numeric values.</p>
+<h3 id="range-resolution-against-file-size">8.3 Range Resolution Against
+File Size</h3>
+<p>The parsed range values are relative to the beginning or end of the
+file, but the actual byte positions to serve depend on the file’s
+current size. The range resolution logic in <code>src/server.c</code>
+maps the parsed range against the file size to produce absolute start
+and end byte positions, the number of bytes to send, and a flag
+indicating whether the response should be partial (206) or full
+(200).</p>
+<p>When no Range header is present, the resolution produces a full-file
+response: start is 0, end is <code>file_size - 1</code>, length is
+<code>file_size</code>, and the partial flag is unset. For a suffix
+range (<code>bytes=-N</code>) where N is less than or equal to the file
+size, the start position is computed as <code>file_size - N</code>, the
+end is <code>file_size - 1</code>, and the response is marked as
+partial. If N exceeds the file size, the start position is clamped to 0,
+effectively serving the entire file as a partial response (this conforms
+to RFC 9110’s specification that suffix ranges exceeding the file size
+should serve from the beginning). For an explicit range
+(<code>bytes=start-end</code>), the end position is clamped to
+<code>file_size - 1</code> if it exceeds the file size, conforming to
+RFC 9110’s statement that “if the last-byte-pos value is absent, or if
+the value is greater than or equal to the current length of the
+representation data, the byte range is interpreted as the remainder of
+the representation.” If the start position is greater than or equal to
+the file size, the range is unsatisfiable and the resolution sets an
+error flag that triggers a 416 response.</p>
+<h3 id="response-generation">8.4 Response Generation</h3>
+<p>When the range resolution produces a partial response, the server
+responds with HTTP 206 Partial Content and includes three mandatory
+headers in addition to the standard response headers. The
+<code>Content-Range</code> header has the format
+<code>bytes start-end/total</code>, where <code>start</code> and
+<code>end</code> are the inclusive byte positions of the served range
+and <code>total</code> is the complete file size, informing the client
+of both the served portion and the file’s full extent. The
+<code>Content-Length</code> header is set to the range length (not the
+file size), telling the client exactly how many body bytes to expect.
+The <code>Accept-Ranges: bytes</code> header is included in all
+successful file responses (both 200 and 206) to advertise the server’s
+range support to clients that may wish to make range requests in the
+future.</p>
+<p>When the range is unsatisfiable, the server responds with HTTP 416
+Range Not Satisfiable and includes the header
+<code>Content-Range: bytes */total</code>, where the asterisk indicates
+that no range is being served and <code>total</code> communicates the
+file’s actual size, allowing the client to construct a valid range for a
+subsequent retry. The response body is empty.</p>
+<h3 id="file-streaming-with-seek">8.5 File Streaming with Seek</h3>
+<p>Range requests require reading from an arbitrary position within a
+file rather than from the beginning. The server uses
+<code>fseeko()</code> to position the file pointer to the resolved start
+byte before beginning the read loop. The choice of <code>fseeko()</code>
+over <code>fseek()</code> is deliberate: <code>fseeko()</code> accepts
+an <code>off_t</code> offset (typically 64 bits on modern systems),
+while <code>fseek()</code> accepts a <code>long</code> offset
+(potentially 32 bits on some platforms), making <code>fseeko()</code>
+necessary for correct operation with files larger than 2 GB on 32-bit
+systems. After seeking, the server enters a streaming loop that reads up
+to 8192 bytes at a time from the file using <code>fread()</code>, sends
+each chunk to the client using a <code>send_all()</code> helper that
+loops around <code>send()</code> to handle partial sends, and decrements
+a remaining-byte counter until all bytes in the requested range have
+been transmitted. This chunk-based streaming approach ensures that the
+server never needs to load an entire file into memory, making it safe
+for serving files of any size limited only by the filesystem.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ minh họa quá trình Range Request — Client
+gửi “Range: bytes=7-10” cho file 100 bytes, Server dùng fseeko() để seek
+đến byte 7, đọc 4 bytes vào buffer 8KB, gửi 206 Partial Content với
+Content-Range: bytes 7-10/100]</strong></p>
+</blockquote>
+<hr />
+<h2 id="testing-and-validation-strategy">9. Testing and Validation
+Strategy</h2>
+<h3 id="testing-philosophy-and-methodology">9.1 Testing Philosophy and
+Methodology</h3>
+<p>The project employs a three-layer testing strategy inspired by the
+testing pyramid model commonly used in software engineering. At the base
+of the pyramid, a large number of fast, isolated unit tests verify the
+correctness of individual functions in the HTTP parser, filesystem
+module, and thread pool queue. In the middle layer, a smaller number of
+end-to-end integration tests exercise the complete server by sending
+real HTTP requests and verifying the responses. At the apex, a
+concurrent benchmark validates performance and reliability under
+realistic load conditions. This layered approach provides both the rapid
+feedback needed during development (unit tests execute in milliseconds)
+and the confidence that the complete system functions correctly as an
+integrated whole (integration tests and benchmarks exercise the full
+code path from TCP connection to HTTP response).</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ Testing Pyramid với 3 tầng: Unit Tests (đáy,
+16 tests, nhanh nhất), Integration Tests (giữa, ~16 test cases),
+Benchmark (đỉnh, 120 concurrent clients). Kèm mô tả ngắn cho mỗi
+tầng]</strong></p>
+</blockquote>
+<p>The project uses a custom lightweight test framework rather than an
+external library such as CUnit or Check. The framework consists of two
+assertion macros: <code>ASSERT_TRUE(condition, message)</code>, which
+increments a failure counter and prints the message if the condition is
+false, and <code>ASSERT_STR_EQ(actual, expected, message)</code>, which
+compares two strings and reports both the expected and actual values on
+failure. Each test module is compiled into a separate binary that
+returns exit code 0 if all assertions pass and exit code 1 if any
+assertion fails. This design has zero external dependencies, provides
+clear and informative failure messages, and integrates naturally with
+Make-based build systems where a non-zero exit code indicates
+failure.</p>
+<h3 id="unit-test-coverage">9.2 Unit Test Coverage</h3>
+<p>The HTTP parser unit tests (<code>tests/unit_http.c</code>) exercise
+eight distinct scenarios. A test for HTTP/1.1 GET requests verifies that
+the parser correctly identifies the GET method and sets the Keep-Alive
+flag to true, reflecting HTTP/1.1’s default persistent connection
+behavior. A test for HTTP/1.0 HEAD requests with an explicit
+<code>Connection: keep-alive</code> header verifies that the parser
+correctly overrides HTTP/1.0’s default close behavior. A test for
+unsupported methods verifies that a POST request is parsed successfully
+but marked as <code>HTTP_METHOD_UNSUPPORTED</code>, ensuring that the
+parser does not confuse unsupported methods with malformed requests. A
+test for the <code>Connection: close</code> header verifies that an
+HTTP/1.1 request with this header correctly disables Keep-Alive. A test
+for query string stripping verifies that the path
+<code>/index.html?cache=false</code> is stored as
+<code>/index.html</code> without the query string. Two tests for Range
+header parsing verify that the explicit form <code>bytes=7-10</code>
+produces <code>range_start=7, range_end=10, range_is_suffix=0</code> and
+that the suffix form <code>bytes=-5</code> produces
+<code>range_start=5, range_is_suffix=1</code>.</p>
+<p>The filesystem unit tests (<code>tests/unit_files.c</code>) exercise
+six scenarios covering MIME type detection (verifying that
+<code>.html</code> maps to <code>text/html</code>, <code>.css</code>
+maps to <code>text/css</code>, and unknown extensions map to
+<code>application/octet-stream</code>), path resolution under the
+document root (verifying that <code>/index.html</code> resolves to the
+correct path within the <code>www</code> directory), path traversal
+rejection (verifying that both <code>/../etc/passwd</code> and the
+URL-encoded variant <code>/%2e%2e/etc/passwd</code> are rejected as
+forbidden), and directory listing generation (verifying that the
+generated HTML contains the expected entries with properly URL-encoded
+links and human-readable display names).</p>
+<p>The thread pool unit tests (<code>tests/unit_thread_pool.c</code>)
+exercise two critical concurrency properties. The FIFO ordering test
+enqueues multiple items into the queue and verifies that they are
+dequeued in the same order, confirming that the circular buffer
+maintains first-in-first-out semantics. The shutdown wakeup test creates
+a consumer thread that blocks on an empty queue, then calls
+<code>socket_queue_shutdown()</code> from the main thread and verifies
+that the consumer thread exits without deadlock — this confirms that the
+shutdown broadcast mechanism correctly unblocks all waiting threads.</p>
+<h3 id="integration-test-architecture">9.3 Integration Test
+Architecture</h3>
+<p>The integration test script (<code>tests/run_tests.sh</code>)
+provides end-to-end validation of the complete server. The script starts
+the server as a background process, waits for it to become ready by
+polling with <code>curl</code> in a loop with 100ms intervals (handling
+the variable startup latency without arbitrary fixed delays), runs a
+sequence of <code>curl</code> commands that exercise different HTTP
+features, checks each response against expected behavior using
+<code>grep</code> and exit code assertions, and finally terminates the
+server process. A <code>trap</code> command ensures the server is killed
+even if the script exits abnormally due to an assertion failure.</p>
+<p>The integration tests cover serving an existing file with 200 OK and
+verifying the body content, stripping query strings and confirming the
+same content is returned, HEAD responses returning 200 OK with no body,
+404 Not Found for non-existent files, 403 Forbidden for path traversal
+attempts using <code>../</code>, correct CSS MIME type in the
+Content-Type header, directory listing generation with HTML content, URL
+encoding of special characters in directory listing links, retrieval of
+files with URL-encoded names (e.g., <code>space%20name.txt</code>), 501
+Not Implemented for POST requests, 206 Partial Content for valid
+byte-range requests, 416 Range Not Satisfiable for unsatisfiable ranges,
+Keep-Alive connection reuse (verified using <code>netcat</code> to send
+two pipelined requests over a single TCP connection), access log
+verification (confirming that a CLF-formatted entry appears in the log
+file after a request), and concurrent stress testing with 120
+simultaneous clients.</p>
+<p>The Keep-Alive test deserves special mention because it uses
+<code>netcat</code> rather than <code>curl</code>. The <code>curl</code>
+utility opens a new TCP connection for each request by default, making
+it unsuitable for testing persistent connections. Netcat provides raw
+socket-level control, allowing the test to send two complete HTTP
+request messages over a single TCP connection and verify that both
+responses are received in the output, confirming that the server
+correctly maintained the persistent connection between requests.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Ảnh chụp terminal chạy <code>make test</code>
+thành công, hiển thị output từ unit tests (tên mỗi test + PASS) và
+integration tests (tên mỗi test case + PASS), kết thúc bằng “All tests
+passed”]</strong></p>
+</blockquote>
+<hr />
+<h2 id="performance-analysis-and-benchmarking">10. Performance Analysis
+and Benchmarking</h2>
+<h3 id="benchmark-design">10.1 Benchmark Design</h3>
+<p>The benchmark script (<code>bench/bench.sh</code>) measures the
+server’s throughput and reliability under concurrent load. The script
+accepts four parameters: the host address (defaulting to
+<code>127.0.0.1</code>), the port (defaulting to 18080), the request
+path (defaulting to <code>/index.html</code>), and the number of
+concurrent clients (defaulting to 120). It records the start time in
+milliseconds using <code>date +%s%3N</code>, spawns the specified number
+of clients as independent background subshell processes (each executing
+<code>curl --max-time 5 -s -o /dev/null</code> and writing the exit code
+to a temporary file), waits for all background processes to complete
+using the <code>wait</code> builtin, records the end time, and computes
+the elapsed time, success count, failure count, and approximate requests
+per second. Each client runs as a separate OS process with its own
+<code>curl</code> invocation, ensuring true concurrency rather than
+multiplexed or sequential requests. The <code>--max-time 5</code> flag
+ensures that any client that does not receive a response within 5
+seconds is counted as a failure rather than hanging indefinitely.</p>
+<h3 id="results-and-analysis">10.2 Results and Analysis</h3>
+<p>The benchmark was executed with the following configuration: 8 worker
+threads, queue capacity 128, and 120 concurrent <code>curl</code>
+clients fetching <code>/index.html</code> from the document root. Under
+these conditions, all 120 clients completed successfully with zero
+failures, confirming that the thread pool and bounded queue correctly
+handle concurrent load that exceeds the thread count. The total elapsed
+time was approximately 1050 milliseconds, yielding a throughput of
+roughly 114 requests per second.</p>
+<blockquote>
+<p><strong>[Chèn ảnh: Ảnh chụp terminal chạy <code>make bench</code>
+hiển thị kết quả benchmark — số successes: 120, failures: 0, elapsed
+time: ~1050ms, requests per second: ~114]</strong></p>
+</blockquote>
+<p>Several factors contribute to the observed throughput
+characteristics. The primary bottleneck is file I/O: each request
+requires at least three system calls (<code>stat()</code> for metadata,
+<code>fopen()</code> for opening the file, <code>fread()</code> for
+reading content) plus additional calls for writing the response and
+closing the file. These system calls involve context switches between
+user mode and kernel mode, each of which has a cost on the order of
+microseconds. A secondary bottleneck is queue contention: the single
+mutex protecting the bounded queue creates a serialization point, and
+under high concurrency, threads briefly compete for the lock during
+enqueue and dequeue operations. A third bottleneck is the access log
+mutex, which serializes all log writes across all worker threads and
+includes a <code>fflush()</code> system call inside the critical
+section.</p>
+<p>The fixed thread pool design provides bounded and predictable
+resource usage: exactly N threads (configured with <code>-t</code>),
+queue memory proportional to the configured capacity, approximately 64
+KB of stack per thread (the default <code>pthread_create</code> stack
+size), and a maximum concurrent connection capacity equal to the thread
+count plus the queue capacity. This predictability is a fundamental
+advantage over thread-per-connection designs, where resource consumption
+grows linearly with the number of connected clients and can reach
+unbounded levels under adversarial conditions.</p>
+<h3 id="potential-optimizations">10.3 Potential Optimizations</h3>
+<p>Several optimizations could significantly improve throughput for
+production use. The <code>sendfile(2)</code> system call could bypass
+user-space buffer copies entirely by instructing the kernel to transfer
+file data directly from the page cache to the socket buffer, eliminating
+two memory copies per request. Per-worker log buffering could replace
+the global log mutex with thread-local buffers that are periodically
+flushed, reducing contention to brief periodic intervals. An
+event-driven I/O model using <code>epoll(7)</code> could handle
+thousands of idle Keep-Alive connections with very few threads, avoiding
+the current limitation where each active Keep-Alive connection ties up a
+worker thread even during idle periods. Configurable socket timeouts
+would prevent idle Keep-Alive connections from monopolizing worker
+threads indefinitely. These optimizations are left as directions for
+future work, as the current implementation prioritizes clarity and
+correctness over maximum performance.</p>
+<hr />
+<h2 id="conclusion-and-future-work">11. Conclusion and Future Work</h2>
+<h3 id="summary-of-contributions">11.1 Summary of Contributions</h3>
+<p>This project successfully demonstrates a realistic concurrent network
+server in C that integrates a comprehensive set of system programming
+concepts into a single, functioning application. The server correctly
+handles TCP socket lifecycle management from creation through
+acceptance, data exchange, and closure. It implements HTTP/1.0 and
+HTTP/1.1 request parsing with correct version-specific Keep-Alive
+semantics and strict input validation. Its thread pool architecture
+provides bounded, predictable resource usage through a producer-consumer
+queue with mutex and condition variable synchronization, including
+backpressure via HTTP 503 when the system is overloaded. The five-stage
+path resolution pipeline provides defense-in-depth against path
+traversal vulnerabilities, combining string-level checks, canonical path
+resolution, and chroot-style prefix verification. The RFC 9110-compliant
+byte-range support enables partial content delivery with correct
+handling of explicit ranges, suffix ranges, and unsatisfiable ranges.
+The thread-safe access logging subsystem provides crash-safe Common Log
+Format output using mutex-protected writes with immediate flushing. The
+comprehensive test suite — comprising 16 unit tests, 15 integration
+tests, and a 120-client concurrent benchmark — validates both
+correctness and reliability under load.</p>
+<p>The modular architecture with clean boundaries between the HTTP
+parser, filesystem resolver, thread pool, server core, and logging
+module demonstrates separation of concerns and allows each component to
+be understood, tested, and maintained independently. The strict
+compilation flags (<code>-Wall -Wextra -Werror -pedantic</code>) and
+consistent use of safe string operations (<code>snprintf</code>, bounded
+copies, overflow checks) reflect a commitment to code quality and
+security.</p>
+<h3 id="limitations">11.2 Limitations</h3>
+<p>The current implementation has several intentional limitations
+appropriate for the project’s educational scope. The server does not
+support TLS/HTTPS, leaving all communication in plaintext. Only HTTP/1.0
+and HTTP/1.1 are supported, with no provision for HTTP/2 or HTTP/3.
+Files are re-read from disk for every request without caching, which is
+inefficient for frequently accessed files. Response compression (gzip,
+brotli) is not implemented. Multi-range requests are not supported,
+avoiding the complexity of multipart MIME responses. The server provides
+no authentication mechanism. All I/O is blocking, meaning each worker
+thread can handle only one connection at a time and is idle during
+periods of client inactivity on Keep-Alive connections.</p>
+<h3 id="directions-for-future-work">11.3 Directions for Future Work</h3>
+<p>Several enhancements could extend the server toward production
+readiness. At low complexity, the <code>sendfile(2)</code> system call
+could eliminate user-space buffer copies for file serving, configurable
+socket timeouts could prevent idle connections from monopolizing worker
+threads, and HTTP Date headers could be added to responses for RFC
+compliance. At medium complexity, per-worker log buffering could reduce
+logging contention, multi-range response support could enable more
+efficient partial content delivery, and conditional request support
+(<code>If-Modified-Since</code> with 304 Not Modified) could reduce
+bandwidth usage for cached content. At high complexity, an event-driven
+I/O architecture using <code>epoll(7)</code> or <code>kqueue</code>
+could handle tens of thousands of concurrent connections, and TLS
+integration using OpenSSL or LibreSSL could enable secure communication.
+Each of these enhancements would deepen the system programming knowledge
+exercised by the project while bringing the server closer to
+production-grade capabilities.</p>
+<hr />
+<h2 id="references">12. References</h2>
+<ol type="1">
+<li><p>Berners-Lee, T., Fielding, R., &amp; Frystyk, H. (1996).
+Hypertext Transfer Protocol – HTTP/1.0. RFC 1945. Internet Engineering
+Task Force. https://www.rfc-editor.org/rfc/rfc1945</p></li>
+<li><p>Fielding, R., Nottingham, M., &amp; Reschke, J. (2022). HTTP/1.1.
+RFC 9112. Internet Engineering Task Force.
+https://www.rfc-editor.org/rfc/rfc9112</p></li>
+<li><p>Fielding, R., Nottingham, M., &amp; Reschke, J. (2022). HTTP
+Semantics. RFC 9110. Internet Engineering Task Force.
+https://www.rfc-editor.org/rfc/rfc9110</p></li>
+<li><p>IEEE &amp; The Open Group. (2018). The Open Group Base
+Specifications Issue 7, 2018 edition (POSIX.1-2017).
+https://pubs.opengroup.org/onlinepubs/9699919799/</p></li>
+<li><p>Kerrisk, M. (2010). <em>The Linux Programming Interface: A Linux
+and UNIX System Programming Handbook</em>. No Starch Press.</p></li>
+<li><p>Stevens, W. R., Fenner, B., &amp; Rudoff, A. M. (2004). <em>UNIX
+Network Programming, Volume 1: The Sockets Networking API</em> (3rd
+ed.). Addison-Wesley.</p></li>
+<li><p>Butenhof, D. R. (1997). <em>Programming with POSIX Threads</em>.
+Addison-Wesley.</p></li>
+<li><p>MITRE Corporation. (2023). CWE-22: Improper Limitation of a
+Pathname to a Restricted Directory (‘Path Traversal’).
+https://cwe.mitre.org/data/definitions/22.html</p></li>
+<li><p>Tanenbaum, A. S., &amp; Bos, H. (2015). <em>Modern Operating
+Systems</em> (4th ed.). Pearson.</p></li>
+<li><p>GNU Make Manual.
+https://www.gnu.org/software/make/manual/</p></li>
+<li><p>Linux man pages: <code>socket(2)</code>, <code>bind(2)</code>,
+<code>listen(2)</code>, <code>accept(2)</code>, <code>recv(2)</code>,
+<code>send(2)</code>, <code>pthread_create(3)</code>,
+<code>pthread_mutex_lock(3)</code>, <code>pthread_cond_wait(3)</code>,
+<code>realpath(3)</code>, <code>stat(2)</code>, <code>opendir(3)</code>,
+<code>fseeko(3)</code>, <code>signal(2)</code>,
+<code>sendfile(2)</code>, <code>epoll(7)</code>.</p></li>
+</ol>
+<hr />
+<h2 id="appendices">13. Appendices</h2>
+<h3 id="appendix-a-module-dependency-graph">Appendix A: Module
+Dependency Graph</h3>
+<p>The following diagram illustrates the compile-time dependency
+relationships between the project’s modules. Dependencies flow downward
+from the entry point through the server core to the leaf modules, which
+have no internal dependencies on other project modules. This acyclic
+dependency structure ensures that changes to leaf modules do not cascade
+upward, and that each module can be compiled and tested in
+isolation.</p>
+<pre class="mermaid"><code>graph TD
+    Main[&quot;main.c&quot;] --&gt; Config[&quot;config.h&quot;]
+    Main --&gt; Server[&quot;server.c / server.h&quot;]
+    Server --&gt; Config
+    Server --&gt; HTTP[&quot;http.c / http.h&quot;]
+    Server --&gt; Files[&quot;files.c / files.h&quot;]
+    Server --&gt; ThreadPool[&quot;thread_pool.c / thread_pool.h&quot;]
+    Server --&gt; Log[&quot;log.c / log.h&quot;]</code></pre>
+<blockquote>
+<p><strong>[Chèn ảnh: Sơ đồ dependency giữa các module, vẽ bằng draw.io
+với các khối module có màu và mũi tên dependency rõ ràng]</strong></p>
+</blockquote>
+<h3 id="appendix-b-http-status-code-decision-tree">Appendix B: HTTP
+Status Code Decision Tree</h3>
+<p>The following flowchart shows the decision logic that determines
+which HTTP status code is returned for a given request. The tree is
+traversed from top to bottom: first the request is parsed, then the
+method is checked, then the path is resolved, and finally range-specific
+logic determines whether the response is a full 200 or a partial
+206.</p>
+<pre class="mermaid"><code>flowchart TD
+    Start[&quot;Receive Request&quot;] --&gt; Parse{&quot;Parse OK?&quot;}
+    Parse --&gt;|No| R400[&quot;400 Bad Request&quot;]
+    Parse --&gt;|Yes| Method{&quot;Method supported?&quot;}
+    Method --&gt;|No| R501[&quot;501 Not Implemented&quot;]
+    Method --&gt;|Yes| Resolve{&quot;Path resolves?&quot;}
+    Resolve --&gt;|Not Found| R404[&quot;404 Not Found&quot;]
+    Resolve --&gt;|Forbidden| R403[&quot;403 Forbidden&quot;]
+    Resolve --&gt;|Error| R500[&quot;500 Internal Server Error&quot;]
+    Resolve --&gt;|OK| Kind{&quot;File or Directory?&quot;}
+    Kind --&gt;|Directory| R200D[&quot;200 OK (directory listing)&quot;]
+    Kind --&gt;|File| Range{&quot;Range header present?&quot;}
+    Range --&gt;|No| R200F[&quot;200 OK (full file)&quot;]
+    Range --&gt;|Yes| RangeOK{&quot;Range satisfiable?&quot;}
+    RangeOK --&gt;|No| R416[&quot;416 Range Not Satisfiable&quot;]
+    RangeOK --&gt;|Yes| R206[&quot;206 Partial Content&quot;]</code></pre>
+<blockquote>
+<p><strong>[Chèn ảnh: Flowchart quyết định HTTP status code, vẽ đẹp bằng
+draw.io hoặc Figma với các nút có màu tương ứng status code (xanh cho
+2xx, vàng cho 4xx, đỏ cho 5xx)]</strong></p>
+</blockquote>
+<h3 id="appendix-c-source-code-statistics">Appendix C: Source Code
+Statistics</h3>
+<p>The server’s source code comprises approximately 1,734 lines across
+six modules, with the server core (<code>server.c</code>) being the
+largest at approximately 600 lines due to its role as the integration
+hub connecting all other modules. The filesystem module
+(<code>files.c</code>) is the second largest at approximately 500 lines,
+reflecting the complexity of safe path resolution and directory listing
+generation. The HTTP parser (<code>http.c</code>) contains approximately
+280 lines, the thread pool (<code>thread_pool.c</code>) approximately
+200 lines, the entry point (<code>main.c</code>) approximately 94 lines,
+and the access logger (<code>log.c</code>) approximately 60 lines. The
+test code adds approximately 480 lines across three unit test files and
+one integration test script. The total codebase, including source,
+headers, tests, and build infrastructure, comprises approximately 2,200
+lines — a size that is small enough to be fully understood by a single
+developer while large enough to demonstrate realistic modular design and
+inter-component interaction.</p>
+<h3 id="appendix-d-key-posix-apis-used">Appendix D: Key POSIX APIs
+Used</h3>
+<p>The server exercises a substantial portion of the POSIX API surface
+relevant to network server development. For network I/O, the server uses
+<code>socket()</code> to create TCP sockets, <code>bind()</code> to
+associate sockets with addresses, <code>listen()</code> to mark sockets
+as passive, <code>accept()</code> to accept incoming connections,
+<code>send()</code> and <code>recv()</code> for data transmission,
+<code>getaddrinfo()</code> for address resolution, and
+<code>setsockopt()</code> with <code>SO_REUSEADDR</code> to allow
+immediate rebinding after server restart. For threading, the server uses
+<code>pthread_create()</code> to spawn worker threads,
+<code>pthread_join()</code> to wait for their completion,
+<code>pthread_mutex_lock()</code> and
+<code>pthread_mutex_unlock()</code> for mutual exclusion, and
+<code>pthread_cond_wait()</code>, <code>pthread_cond_signal()</code>,
+and <code>pthread_cond_broadcast()</code> for condition variable
+synchronization. For filesystem access, the server uses
+<code>realpath()</code> for canonical path resolution,
+<code>stat()</code> for file metadata queries, <code>opendir()</code>,
+<code>readdir()</code>, and <code>closedir()</code> for directory
+traversal, and <code>fopen()</code>, <code>fread()</code>,
+<code>fseeko()</code>, and <code>fclose()</code> for buffered file I/O.
+For time and logging, the server uses <code>localtime_r()</code> for
+thread-safe time conversion and <code>strftime()</code> for timestamp
+formatting. For process management, the server uses
+<code>signal()</code> for signal handler registration and
+<code>getopt()</code> for command-line argument parsing.</p>
+<hr />
+<p><em>End of Report</em></p>

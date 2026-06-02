@@ -409,17 +409,22 @@ static void handle_client(int client_fd, void *context) {
     int keep_going = 1;
     size_t buffered = 0;
 
+    /* Lấy địa chỉ IP của Client để phục vụ ghi nhật ký (log) */
     get_client_ip(client_fd, client_ip, sizeof(client_ip));
 
+    /* Vòng lặp hỗ trợ tính năng HTTP Keep-Alive (Xử lý nhiều yêu cầu trên cùng một kết nối) */
     while (keep_going) {
         response_result_t response = {0, 0};
+        /* Đọc và phân tích yêu cầu HTTP tiếp theo từ luồng socket */
         int read_result = read_next_request(client_fd, buffer, &buffered, &request, request_line, sizeof(request_line));
         int send_result;
 
         if (read_result == 0) {
+            /* Client chủ động đóng kết nối (EOF) */
             break;
         }
         if (read_result < 0) {
+            /* Yêu cầu HTTP không hợp lệ (Bad Request) */
             if (buffered > 0) {
                 extract_request_line(buffer, buffered, request_line, sizeof(request_line));
             } else {
@@ -430,8 +435,10 @@ static void handle_client(int client_fd, void *context) {
             break;
         }
 
+        /* Kiểm tra xem request có yêu cầu giữ kết nối (Keep-Alive) hay không */
         keep_going = http_should_keep_alive(&request);
 
+        /* Nếu phương thức HTTP không được hỗ trợ (chỉ hỗ trợ GET và HEAD) */
         if (request.method == HTTP_METHOD_UNSUPPORTED) {
             send_result = send_simple_response(client_fd, &request, 501, "Not Implemented\n", keep_going, &response);
             if (send_result != 0) {
@@ -444,8 +451,10 @@ static void handle_client(int client_fd, void *context) {
             continue;
         }
 
+        /* Định vị đường dẫn tệp tin thực tế trên ổ cứng và kiểm tra an toàn bảo mật */
         file_result = file_stat_path(server->config.doc_root, request.path, &info);
         if (file_result != FILE_RESULT_OK) {
+            /* Trả về mã lỗi phù hợp (ví dụ: 404 Not Found hoặc 403 Forbidden) */
             int status = status_from_file_result(file_result);
             char body[128];
 
@@ -461,6 +470,7 @@ static void handle_client(int client_fd, void *context) {
             continue;
         }
 
+        /* Phân biệt đối tượng yêu cầu là thư mục hay tệp tin để trả về phản hồi tương ứng */
         if (info.kind == FILE_KIND_DIRECTORY) {
             send_result = send_directory_response(client_fd, &request, &info, keep_going, &response);
         } else {
@@ -469,9 +479,11 @@ static void handle_client(int client_fd, void *context) {
         if (send_result != 0) {
             break;
         }
+        /* Ghi nhật ký truy cập của client sau khi phản hồi thành công */
         access_log_write(server->access_log, client_ip, request_line, response.status_code, response.body_bytes);
     }
 
+    /* Đóng kết nối TCP socket với client */
     close(client_fd);
 }
 
@@ -484,23 +496,27 @@ static int create_listening_socket(const server_config_t *config) {
     int yes = 1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_UNSPEC;      /* Hỗ trợ cả địa chỉ IPv4 và IPv6 */
+    hints.ai_socktype = SOCK_STREAM;  /* Sử dụng kết nối dòng truyền tin TCP */
+    hints.ai_flags = AI_PASSIVE;      /* Thích hợp cho Socket lắng nghe kết nối đến (Wildcard IP) */
     snprintf(port_text, sizeof(port_text), "%d", config->port);
 
+    /* Biên dịch hostname và port thành cấu trúc thông tin địa chỉ kết nối */
     if (getaddrinfo(config->host, port_text, &hints, &result) != 0) {
         return -1;
     }
 
+    /* Duyệt qua danh sách địa chỉ tìm được để thử bind socket */
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         listen_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (listen_fd == -1) {
             continue;
         }
+        /* Cấu hình SO_REUSEADDR để tránh lỗi bị giữ cổng (Address already in use) khi khởi động lại server gấp */
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        /* Bind socket với địa chỉ cổng và đưa socket vào trạng thái lắng nghe kết nối */
         if (bind(listen_fd, rp->ai_addr, rp->ai_addrlen) == 0 && listen(listen_fd, SOMAXCONN) == 0) {
-            break;
+            break; /* Thiết lập socket lắng nghe thành công */
         }
         close(listen_fd);
         listen_fd = -1;
@@ -549,26 +565,30 @@ int server_run(server_t *server) {
     }
 
     context.server = server;
+    /* Khởi động Thread Pool xử lý kết nối song song */
     if (thread_pool_start(&server->pool, server->queue, server->config.thread_count, handle_client, &context) != 0) {
         return 1;
     }
 
+    /* Vòng lặp Accept Loop chạy trên luồng chính để tiếp nhận các kết nối mới */
     while (!server->should_stop) {
         int client_fd = accept(server->listen_fd, NULL, NULL);
         queue_result_t enqueue_result;
 
         if (client_fd < 0) {
             if (errno == EINTR) {
-                continue;
+                continue; /* Bị ngắt quãng bởi tín hiệu ngắt hệ thống, thử accept lại */
             }
             if (server->should_stop) {
-                break;
+                break; /* Đã có yêu cầu dừng hệ thống, thoát vòng lặp accept */
             }
             continue;
         }
 
+        /* Đẩy socket client nhận được vào hàng đợi cho các worker thread xử lý */
         enqueue_result = socket_queue_enqueue(server->queue, client_fd);
         if (enqueue_result == QUEUE_FULL) {
+            /* Nếu hàng đợi quá tải (đầy), luồng chính tự phản hồi mã 503 và đóng kết nối ngay lập tức */
             response_result_t response = {0, 0};
             char client_ip[128];
 
@@ -577,10 +597,12 @@ int server_run(server_t *server) {
             access_log_write(server->access_log, client_ip, "-", response.status_code, response.body_bytes);
             close(client_fd);
         } else if (enqueue_result != QUEUE_OK) {
+            /* Nếu hàng đợi gặp lỗi khác hoặc đã đóng, ngắt kết nối với client */
             close(client_fd);
         }
     }
 
+    /* Đợi tất cả các Worker Thread dừng lại hoàn toàn và giải phóng thread pool */
     thread_pool_stop(&server->pool);
     return 0;
 }

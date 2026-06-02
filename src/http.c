@@ -223,17 +223,20 @@ http_parse_result_t http_parse_request(const char *raw, size_t length, http_requ
 
     memset(request, 0, sizeof(*request));
 
+    /* Bước 1: Tìm dòng đầu tiên của HTTP Request (kết thúc bằng \r\n) */
     line_end = find_crlf(raw, length);
     if (line_end == NULL || (size_t)(line_end - raw) >= length) {
         return HTTP_PARSE_BAD_REQUEST;
     }
 
     request_line_len = (size_t)(line_end - raw);
+    /* Tìm khoảng trắng thứ nhất phân tách phương thức (Method) và đường dẫn (URI) */
     first_space = memchr(raw, ' ', request_line_len);
     if (first_space == NULL) {
         return HTTP_PARSE_BAD_REQUEST;
     }
 
+    /* Tìm khoảng trắng thứ hai phân tách đường dẫn (URI) và phiên bản HTTP (Version) */
     second_space = memchr(first_space + 1, ' ', request_line_len - (size_t)(first_space + 1 - raw));
     if (second_space == NULL || second_space == first_space + 1) {
         return HTTP_PARSE_BAD_REQUEST;
@@ -245,27 +248,35 @@ http_parse_result_t http_parse_request(const char *raw, size_t length, http_requ
 
     target_start = first_space + 1;
     target_len = (size_t)(second_space - first_space - 1);
+    
+    /* Phát hiện phần Query String (ví dụ: ?cache=false) để loại bỏ, chỉ giữ lại đường dẫn tệp thực tế */
     query_start = memchr(target_start, '?', target_len);
     path_len = query_start == NULL ? target_len : (size_t)(query_start - target_start);
     if (path_len == 0) {
         return HTTP_PARSE_BAD_REQUEST;
     }
 
+    /* Sao chép an toàn có giới hạn kích thước chuỗi sang struct request */
     copy_bounded(request->method_text, sizeof(request->method_text), raw, (size_t)(first_space - raw));
     copy_bounded(request->path, sizeof(request->path), target_start, path_len);
     copy_bounded(request->version_text, sizeof(request->version_text), second_space + 1, (size_t)(line_end - second_space - 1));
 
+    /* Biên dịch phương thức dạng văn bản thành mã Enum tương ứng (GET, HEAD, UNSUPPORTED) */
     request->method = parse_method(request->method_text);
     request->version = parse_version(request->version_text);
     if (request->version == HTTP_VERSION_UNKNOWN) {
         return HTTP_PARSE_BAD_REQUEST;
     }
 
+    /* Phân tích tiếp các Header ở các dòng tiếp theo (như Connection, Range) */
     parse_headers(line_end + 2, length - request_line_len - 2, request);
 
+    /* Xác định trạng thái Keep-Alive của kết nối dựa trên phiên bản HTTP và header Connection */
     if (request->version == HTTP_VERSION_11) {
+        /* HTTP/1.1 mặc định bật Keep-Alive ngoại trừ khi client chỉ định rõ Connection: close */
         request->keep_alive_requested = !ascii_case_equal(request->connection, "close");
     } else {
+        /* HTTP/1.0 mặc định tắt Keep-Alive ngoại trừ khi client gửi Connection: keep-alive */
         request->keep_alive_requested = ascii_case_equal(request->connection, "keep-alive");
     }
 

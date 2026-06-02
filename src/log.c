@@ -58,12 +58,17 @@ void access_log_write(access_log_t *log, const char *client_ip, const char *requ
     }
 
     now = time(NULL);
+    /* Sử dụng localtime_r (phiên bản reentrant) thay vì localtime để đảm bảo an toàn đa luồng, 
+       kết quả ghi nhận trực tiếp vào struct cục bộ local_time nằm trên Stack thay vì static buffer dùng chung */
     localtime_r(&now, &local_time);
     strftime(timestamp, sizeof(timestamp), "%d/%b/%Y:%H:%M:%S %z", &local_time);
 
+    /* Khóa mutex bảo vệ việc ghi log vào file chung giữa các luồng worker */
     pthread_mutex_lock(&log->mutex);
     fprintf(log->file, "%s - - [%s] \"%s\" %d %zu\n",
             client_ip, timestamp, request_line, status_code, bytes_sent);
+    /* Đẩy dữ liệu tức thời từ buffer của C xuống ổ cứng để đảm bảo log không bị mất nếu server crash */
     fflush(log->file);
+    /* Mở khóa mutex để các luồng khác có thể ghi log tiếp theo */
     pthread_mutex_unlock(&log->mutex);
 }

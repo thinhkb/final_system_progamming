@@ -4,15 +4,15 @@
 #include <stdlib.h>
 
 struct socket_queue {
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-    int *items;
-    size_t capacity;
-    size_t head;
-    size_t tail;
-    size_t count;
-    int shutdown;
+    pthread_mutex_t mutex;     /* Khóa dùng để đồng bộ hóa việc truy cập hàng đợi giữa các luồng */
+    pthread_cond_t not_empty;  /* Biến điều kiện báo hiệu hàng đợi KHÔNG rỗng (để đánh thức luồng worker) */
+    pthread_cond_t not_full;   /* Biến điều kiện báo hiệu hàng đợi KHÔNG đầy (hiện tại không block luồng chính) */
+    int *items;                /* Mảng động chứa các socket descriptor (client_fd) */
+    size_t capacity;           /* Sức chứa tối đa của hàng đợi */
+    size_t head;               /* Chỉ số đầu hàng đợi (lấy phần tử ra ở đây) */
+    size_t tail;               /* Chỉ số cuối hàng đợi (thêm phần tử vào ở đây) */
+    size_t count;              /* Số lượng kết nối hiện có trong hàng đợi */
+    int shutdown;              /* Cờ báo hiệu đóng hàng đợi khi server dừng */
 };
 
 typedef struct {
@@ -94,17 +94,22 @@ queue_result_t socket_queue_enqueue(socket_queue_t *queue, int client_fd) {
         return QUEUE_ERROR;
     }
 
+    /* Khóa mutex trước khi thay đổi dữ liệu dùng chung của hàng đợi */
     pthread_mutex_lock(&queue->mutex);
     if (queue->shutdown) {
         result = QUEUE_CLOSED;
     } else if (queue->count == queue->capacity) {
+        /* Hàng đợi đầy: không block luồng chính mà trả về mã QUEUE_FULL để phản hồi 503 lập tức */
         result = QUEUE_FULL;
     } else {
+        /* Thêm socket của client vào cuối hàng đợi vòng (circular queue) */
         queue->items[queue->tail] = client_fd;
         queue->tail = (queue->tail + 1) % queue->capacity;
         queue->count++;
+        /* Phát tín hiệu đánh thức một worker thread đang ngủ do hàng đợi rỗng */
         pthread_cond_signal(&queue->not_empty);
     }
+    /* Giải phóng khóa mutex để các luồng khác có thể truy cập */
     pthread_mutex_unlock(&queue->mutex);
 
     return result;
@@ -115,20 +120,31 @@ queue_result_t socket_queue_dequeue(socket_queue_t *queue, int *client_fd) {
         return QUEUE_ERROR;
     }
 
+    /* Khóa mutex trước khi đọc/ghi dữ liệu dùng chung */
     pthread_mutex_lock(&queue->mutex);
+    
+    /* Sử dụng vòng lặp while để tránh hiện tượng đánh thức giả (Spurious Wakeup) 
+       và phòng trường hợp luồng khác nhảy vào lấy mất phần tử trước khi luồng này kịp khóa mutex */
     while (queue->count == 0 && !queue->shutdown) {
+        /* Giải phóng mutex và đi vào giấc ngủ, chờ signal not_empty từ luồng chính */
         pthread_cond_wait(&queue->not_empty, &queue->mutex);
     }
 
+    /* Nếu hàng đợi trống và server đang dừng, mở khóa mutex và báo hàng đợi đã đóng */
     if (queue->count == 0 && queue->shutdown) {
         pthread_mutex_unlock(&queue->mutex);
         return QUEUE_CLOSED;
     }
 
+    /* Lấy socket ra khỏi đầu hàng đợi vòng */
     *client_fd = queue->items[queue->head];
     queue->head = (queue->head + 1) % queue->capacity;
     queue->count--;
+    
+    /* Phát tín hiệu báo hàng đợi đã có chỗ trống */
     pthread_cond_signal(&queue->not_full);
+    
+    /* Giải phóng khóa mutex */
     pthread_mutex_unlock(&queue->mutex);
 
     return QUEUE_OK;
@@ -164,6 +180,7 @@ int thread_pool_start(thread_pool_t *pool, socket_queue_t *queue, int thread_cou
     pool->handler = handler;
     pool->handler_context = context;
 
+    /* Khởi tạo trước một số lượng luồng làm việc (Worker Threads) cố định lúc khởi chạy */
     for (int i = 0; i < thread_count; i++) {
         worker_args_t *args = malloc(sizeof(*args));
         if (args == NULL) {
@@ -172,6 +189,7 @@ int thread_pool_start(thread_pool_t *pool, socket_queue_t *queue, int thread_cou
             return -1;
         }
         args->pool = pool;
+        /* Tạo luồng mới chạy hàm worker_main */
         if (pthread_create(&threads[i], NULL, worker_main, args) != 0) {
             free(args);
             pool->thread_count = i;

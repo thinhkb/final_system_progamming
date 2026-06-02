@@ -225,20 +225,25 @@ static file_result_t decode_path(const char *input, char *output, size_t output_
         return FILE_RESULT_ERROR;
     }
 
+    /* Duyệt qua từng ký tự của đường dẫn URL yêu cầu */
     for (size_t i = 0; input[i] != '\0'; i++) {
         unsigned char ch = (unsigned char)input[i];
         if (ch == '%') {
+            /* Phát hiện mã hóa Percent-encoding (ví dụ %20, %2E) */
             int high = hex_value(input[i + 1]);
             int low = hex_value(input[i + 2]);
             if (high < 0 || low < 0) {
-                return FILE_RESULT_FORBIDDEN;
+                return FILE_RESULT_FORBIDDEN; /* Định dạng mã hex không hợp lệ */
             }
+            /* Gộp 2 ký tự hex thành 1 ký tự ascii thực tế */
             ch = (unsigned char)((high << 4) | low);
             i += 2;
         } else if (ch == '+') {
+            /* Ký tự '+' trong URL query thường đại diện cho khoảng trắng */
             ch = ' ';
         }
 
+        /* Chặn đứng ký tự null byte (\0) hoặc ký tự dấu gạch chéo ngược (\) để chống hack ẩn */
         if (ch == '\0' || ch == '\\') {
             return FILE_RESULT_FORBIDDEN;
         }
@@ -259,6 +264,7 @@ static int contains_dot_dot_segment(const char *path) {
         while (*p == '/') {
             p++;
         }
+        /* Phát hiện phân đoạn ".." nguy hiểm (ví dụ: ../ hoặc /.. tại cuối đường dẫn) */
         if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0')) {
             return 1;
         }
@@ -427,11 +433,13 @@ file_result_t file_resolve_path(const char *doc_root, const char *request_path, 
         return FILE_RESULT_ERROR;
     }
 
+    /* Bước 1: Giải mã URL Encoding */
     decode_result = decode_path(request_path, decoded, sizeof(decoded));
     if (decode_result != FILE_RESULT_OK) {
         return decode_result;
     }
 
+    /* Bước 2: Chặn đứng chuỗi '..' thô ngay lập tức */
     if (contains_dot_dot_segment(decoded)) {
         return FILE_RESULT_FORBIDDEN;
     }
@@ -441,14 +449,17 @@ file_result_t file_resolve_path(const char *doc_root, const char *request_path, 
         relative_path++;
     }
 
+    /* Kết hợp thư mục gốc (doc_root) với đường dẫn tương đối của client */
     if (snprintf(joined, sizeof(joined), "%s/%s", doc_root, relative_path) >= (int)sizeof(joined)) {
         return FILE_RESULT_ERROR;
     }
 
+    /* Bước 3: Phân giải thư mục gốc thành đường dẫn tuyệt đối chuẩn (loại bỏ symlink, ., .. ảo) */
     if (realpath(doc_root, root_real) == NULL) {
         return FILE_RESULT_ERROR;
     }
 
+    /* Bước 4: Phân giải đường dẫn file yêu cầu thành đường dẫn tuyệt đối chuẩn trên đĩa cứng */
     if (realpath(joined, target_real) == NULL) {
         if (errno == ENOENT || errno == ENOTDIR) {
             return FILE_RESULT_NOT_FOUND;
@@ -456,8 +467,9 @@ file_result_t file_resolve_path(const char *doc_root, const char *request_path, 
         return FILE_RESULT_ERROR;
     }
 
+    /* Bước 5: Kiểm tra tiền tố để chắc chắn file yêu cầu vẫn nằm hoàn toàn bên trong thư mục gốc */
     if (!path_has_prefix(target_real, root_real)) {
-        return FILE_RESULT_FORBIDDEN;
+        return FILE_RESULT_FORBIDDEN; /* Đã bị đi ngược hoặc ra ngoài thư mục root! */
     }
 
     if (strlen(target_real) >= resolved_size) {
