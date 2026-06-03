@@ -16,7 +16,7 @@ Level 2 đánh dấu thời điểm chúng ta rời tầng application (nơi HTT
 8. [`send()` / `recv()` — Truyền nhận dữ liệu](#8-send--recv--truyền-nhận-dữ-liệu)
 9. [`SO_REUSEADDR` — Tái sử dụng cổng](#9-so_reuseaddr--tái-sử-dụng-cổng)
 10. [Blocking vs Non-blocking I/O](#10-blocking-vs-non-blocking-io)
-11. [TCP State Machine & TIME_WAIT](#11-tcp-state-machine--time_wait)
+11. [TCP State Machine &amp; TIME_WAIT](#11-tcp-state-machine--time_wait)
 12. [Đi sâu vào TCP Buffer](#12-đi-sâu-vào-tcp-buffer)
 13. [Bigger Picture: HTTP trên TCP](#13-bigger-picture-http-trên-tcp)
 
@@ -216,23 +216,24 @@ User space                                          Kernel space
 listen_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 ```
 
-| Tham số | Giá trị | Ý nghĩa |
-|----------|---------|-----------|
-| `domain` (AF_INET) | `AF_INET` | IPv4 |
-| | `AF_INET6` | IPv6 |
-| | `AF_UNIX` | Unix domain socket (local) |
+| Tham số               | Giá trị       | Ý nghĩa                             |
+| ---------------------- | --------------- | ------------------------------------- |
+| `domain` (AF_INET)   | `AF_INET`     | IPv4                                  |
+|                        | `AF_INET6`    | IPv6                                  |
+|                        | `AF_UNIX`     | Unix domain socket (local)            |
 | `type` (SOCK_STREAM) | `SOCK_STREAM` | TCP — oriented byte stream, reliable |
-| | `SOCK_DGRAM` | UDP — datagram, unreliable |
-| | `SOCK_RAW` | Raw socket — bypass TCP/UDP |
-| `protocol` | `0` | Auto-select (TCP for SOCK_STREAM) |
-| | `IPPROTO_TCP` | Explicit TCP |
-| | `IPPROTO_UDP` | Explicit UDP |
+|                        | `SOCK_DGRAM`  | UDP — datagram, unreliable           |
+|                        | `SOCK_RAW`    | Raw socket — bypass TCP/UDP          |
+| `protocol`           | `0`           | Auto-select (TCP for SOCK_STREAM)     |
+|                        | `IPPROTO_TCP` | Explicit TCP                          |
+|                        | `IPPROTO_UDP` | Explicit UDP                          |
 
 **Tại sao dùng `SOCK_STREAM`?** Vì HTTP cần reliable, ordered byte stream. `SOCK_DGRAM` (UDP) không đảm bảo thứ tự hoặc không mất gói — không phù hợp cho HTTP.
 
 ### 3.3 Điều gì xảy ra trong kernel?
 
 Khi `socket()` được gọi, kernel:
+
 1. Cấp phát một `struct socket` trong kernel heap
 2. Gắn nó vào fd table entry của process (fd = số nguyên ≥ 3)
 3. Khởi tạo `struct sock` (TCP control block) với trạng thái `CLOSED`
@@ -255,6 +256,7 @@ bind(sockfd, (struct sockaddr*)&addr, sizeof(addr));
 ```
 
 **Vấn đề:**
+
 - `gethostbyname()` không hỗ trợ IPv6
 - `struct sockaddr_in` chỉ dùng cho IPv4
 - Phải tự xử lý nhiều edge cases
@@ -555,6 +557,7 @@ int server_run(server_t *server) {
 ```
 
 **Điểm quan trọng:** Acceptor thread chỉ làm 3 việc:
+
 1. `accept()` — lấy kết nối
 2. `enqueue()` — đặt vào queue
 3. `close()` nếu queue full
@@ -852,17 +855,18 @@ while (1) {
 
 ### 10.4 So sánh Blocking + Thread Pool vs Event-driven
 
-| Aspect | Blocking + Thread Pool (Project này) | Event-driven (epoll/kqueue) |
-|--------|-------------------------------------|------------------------------|
-| Threads | N threads cho N concurrent clients | 1 thread cho 1000+ clients |
-| Memory | Mỗi thread có stack (~8MB) | Stack nhỏ |
-| CPU usage | Context switch khi threads block | Ít context switch |
-| Code complexity | Simple, sequential logic | Complex state machines |
-| Scaling | Poor với 10K+ idle connections | Excellent |
-| Keep-Alive idle | Worker bị chiếm bởi idle connection | Handler nhẹ, return ngay |
-| Phù hợp | Project nhỏ, < 1000 concurrent | Production servers, 10K+ connections |
+| Aspect          | Blocking + Thread Pool (Project này)  | Event-driven (epoll/kqueue)          |
+| --------------- | -------------------------------------- | ------------------------------------ |
+| Threads         | N threads cho N concurrent clients     | 1 thread cho 1000+ clients           |
+| Memory          | Mỗi thread có stack (~8MB)           | Stack nhỏ                           |
+| CPU usage       | Context switch khi threads block       | Ít context switch                   |
+| Code complexity | Simple, sequential logic               | Complex state machines               |
+| Scaling         | Poor với 10K+ idle connections        | Excellent                            |
+| Keep-Alive idle | Worker bị chiếm bởi idle connection | Handler nhẹ, return ngay            |
+| Phù hợp       | Project nhỏ, < 1000 concurrent        | Production servers, 10K+ connections |
 
 **Project này chọn Blocking + Thread Pool** vì:
+
 1. Đơn giản để implement và hiểu
 2. Phù hợp với quy mô project (không phải production server)
 3. Mỗi worker xử lý 1 request hoàn chỉnh → clean sequential code
@@ -939,6 +943,7 @@ if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == 0) {
 ```
 
 **Đây là AN TOÀN vì:**
+
 - TCP sequence numbers ngăn nhầm lẫn data giữa connections
 - TIME_WAIT chỉ để cleanup, không phải security measure
 
@@ -960,10 +965,10 @@ Mỗi socket có 2 buffer:
   RX (Receive):  network → App
 ```
 
-| Buffer | Kernel Parameters | Mặc định Linux | Mặc định macOS |
-|--------|-----------------|---------------|----------------|
-| TX Buffer | `SO_SNDBUF` | ~208KB | ~256KB |
-| RX Buffer | `SO_RCVBUF` | ~208KB | ~256KB |
+| Buffer    | Kernel Parameters | Mặc định Linux | Mặc định macOS |
+| --------- | ----------------- | ----------------- | ----------------- |
+| TX Buffer | `SO_SNDBUF`     | ~208KB            | ~256KB            |
+| RX Buffer | `SO_RCVBUF`     | ~208KB            | ~256KB            |
 
 ### 12.2 Kiểm tra buffer size
 
@@ -996,11 +1001,13 @@ while (remaining > 0) {
 ```
 
 **Nếu client đọc chậm** (ví dụ: bandwidth thấp):
+
 - TX Buffer đầy
 - `send()` blocks hoặc trả về -1/EAGAIN (non-blocking)
 - Worker bị blocked trong khi gửi file → throughput giảm
 
 **Giải pháp trong production:**
+
 - Dùng `sendfile()` (Linux) — zero-copy từ file descriptor sang socket, không qua user buffer
 - Dùng async I/O (io_uring trên Linux)
 

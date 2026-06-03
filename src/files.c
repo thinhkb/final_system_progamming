@@ -177,8 +177,7 @@ static void free_directory_entries(directory_entry_t *entries, size_t entry_coun
     free(entries);
 }
 
-static int append_directory_entry(directory_entry_t **entries, size_t *entry_count, size_t *entry_capacity,
-                                  const char *name, int is_directory) {
+static int append_directory_entry(directory_entry_t **entries, size_t *entry_count, size_t *entry_capacity,const char *name, int is_directory) {
     directory_entry_t *grown;
 
     if (*entry_count == *entry_capacity) {
